@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ripple Effect</title>
+  <style>
+    /* =========================================
+       GLOBAL UI OVERHAUL
+       ========================================= */
+    :root {
+      --primary: #0066ff;
+      --primary-hover: #0052cc;
+      --bg-gradient: linear-gradient(135deg, #f0f4f8 0%, #e2e8f0 100%);
+      --card-bg: #ffffff;
+      --text-main: #1e293b;
+      --text-muted: #64748b;
+      --success: #10b981;
+      --danger: #ef4444;
+    }
+
+    body {
+      margin: 0; padding: 0; font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg-gradient); color: var(--text-main);
+      min-height: 100vh; display: flex; flex-direction: column;
+    }
+
+    header {
+      background: var(--card-bg); padding: 15px 30px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex;
+      justify-content: space-between; align-items: center;
+      position: sticky; top: 0; z-index: 100;
+    }
+
+    header h1 { margin: 0; font-size: 24px; color: var(--primary); }
+    #user-status { font-weight: 500; color: var(--text-muted); }
+
+    main {
+      flex: 1; display: flex; justify-content: center;
+      align-items: flex-start; padding: 40px 20px;
+    }
+
+    .card {
+      background: var(--card-bg); border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+      padding: 40px; width: 100%; max-width: 400px; text-align: center; transition: transform 0.3s ease;
+    }
+
+    .card h2 { margin-top: 0; color: var(--text-main); }
+    
+    input[type="text"], input[type="password"], select {
+      width: 100%; padding: 12px 16px; margin-bottom: 15px; border: 2px solid #e2e8f0;
+      border-radius: 8px; box-sizing: border-box; font-size: 16px; transition: all 0.2s;
+      font-family: inherit; color: var(--text-main);
+    }
+    
+    select {
+      cursor: pointer; appearance: none; -webkit-appearance: none; -moz-appearance: none;
+      background: #fff url("data:image/svg+xml;utf8,<svg fill='%2364748b' height='24' viewBox='0 0 24 24' width='24' xmlns='http://www.w3.org/2000/svg'><path d='M7 10l5 5 5-5z'/><path d='M0 0h24v24H0z' fill='none'/></svg>") no-repeat right 12px center;
+    }
+
+    input:focus, select:focus { 
+      border-color: var(--primary); outline: none; 
+      box-shadow: 0 0 0 3px rgba(0, 102, 255, 0.1); 
+    }
+
+    button {
+      background: var(--primary); color: white; border: none; border-radius: 8px;
+      padding: 12px 20px; font-size: 16px; font-weight: 600; cursor: pointer;
+      width: 100%; margin-bottom: 10px; transition: all 0.2s ease; box-shadow: 0 4px 6px rgba(0, 102, 255, 0.2);
+    }
+
+    button:hover { background: var(--primary-hover); transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0, 102, 255, 0.3); }
+    button:disabled { background: #cbd5e1; cursor: not-allowed; transform: none; box-shadow: none; }
+    button.secondary { background: #f1f5f9; color: #475569; box-shadow: none; }
+    button.secondary:hover { background: #e2e8f0; color: #1e293b; }
+    button.accent { background: #8b5cf6; box-shadow: 0 4px 6px rgba(139, 92, 246, 0.2); }
+    button.accent:hover { background: #7c3aed; }
+
+    hr { border: 0; height: 1px; background: #e2e8f0; margin: 25px 0; }
+
+    .party-code-display {
+      font-size: 36px; font-weight: 900; letter-spacing: 4px; color: var(--primary);
+      background: #f8fafc; padding: 15px; border-radius: 12px; margin: 20px 0; border: 2px dashed #cbd5e1;
+    }
+
+    /* =========================================
+       GAME & LEADERBOARD LAYOUT
+       ========================================= */
+    #game-section, #gallery-section, #results-section, #editor-setup-section, #editor-workspace-section { width: 100%; max-width: 1000px; }
+
+    .topbar {
+      display: flex; justify-content: space-between; align-items: center;
+      background: var(--card-bg); padding: 15px 25px; border-radius: 12px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 25px;
+    }
+
+    .topbar .back-btn { width: auto; margin: 0; padding: 8px 16px; box-shadow: none; }
+    #timer { font-size: 24px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--primary); }
+
+    .game-layout { display: flex; flex-wrap: wrap; gap: 30px; justify-content: center; align-items: flex-start; }
+
+    .leaderboard-area {
+      background: var(--card-bg); border-radius: 16px; padding: 25px; min-width: 280px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.08); position: sticky; top: 100px;
+    }
+
+    .leaderboard-area h3 { margin-top: 0; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; color: var(--text-main); text-align: center;}
+    
+    #leaderboard { list-style: none; padding: 0; margin: 0; }
+    #leaderboard li {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 0; border-bottom: 1px solid #f1f5f9; font-size: 16px; font-weight: 500;
+    }
+    #leaderboard li .time { color: var(--text-muted); font-size: 14px; font-weight: bold; }
+    #leaderboard li .finished-time { color: var(--success); }
+
+    #controls { display: flex; gap: 10px; margin-top: 20px; width: 100%;}
+    #controls button { margin: 0; flex: 1; }
+
+    /* =========================================
+       BOARD RENDERING
+       ========================================= */
+    .board-container {
+      display: grid; margin: 0 auto; width: max-content;
+      background: #fff; border: 4px solid #1e293b; border-radius: 8px; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+    }
+    
+    .cell {
+      width: 55px; height: 55px; display: flex; align-items: center; justify-content: center;
+      font-size: 26px; box-sizing: border-box; border: 1px solid #cbd5e1; 
+      text-align: center; font-family: inherit; padding: 0; margin: 0; outline: none; 
+      transition: background-color 0.3s ease, transform 0.1s ease, color 0.3s ease; cursor: pointer;
+    }
+    
+    div.cell.given { font-weight: 900; color: #0f172a; cursor: default; }
+    input.cell { color: var(--primary); font-weight: 700; background-color: transparent; cursor: text; }
+    
+    /* Div text styling matches the input text exactly for when we swap them */
+    div.cell.solved-text { color: var(--primary); font-weight: 700; background-color: transparent; cursor: default; }
+
+    input.cell:focus {
+      background-color: rgba(255, 255, 255, 0.9) !important; transform: scale(1.1);
+      z-index: 10; border-radius: 6px; box-shadow: 0 0 15px rgba(0,102,255,0.4);
+    }
+    
+    .cell.error { background-color: #fecaca !important; color: var(--danger) !important; font-weight: 900; }
+
+    /* =========================================
+       RESULTS / PODIUM SCREEN
+       ========================================= */
+    .podium-list { list-style: none; padding: 0; margin: 30px 0; text-align: left; }
+    .podium-list li {
+      display: flex; justify-content: flex-start; align-items: center;
+      padding: 20px; margin-bottom: 15px; background: var(--card-bg); border-radius: 12px;
+      font-size: 18px; font-weight: 600; box-shadow: 0 4px 10px rgba(0,0,0,0.05); border-left: 6px solid #cbd5e1;
+    }
+    .podium-list li:nth-child(1) { border-left-color: #fbbf24; background: #fffbeb; font-size: 24px; transform: scale(1.05); margin-bottom: 25px; box-shadow: 0 8px 20px rgba(251, 191, 36, 0.2); }
+    .podium-list li:nth-child(2) { border-left-color: #94a3b8; background: #f8fafc; font-size: 20px; }
+    .podium-list li:nth-child(3) { border-left-color: #b45309; background: #fff7ed; font-size: 18px; }
+
+    .gallery-card { background: var(--card-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }
+    .gallery-card button { width: auto; margin: 0; }
+
+    /* =========================================
+       EDITOR SPECIFIC STYLES
+       ========================================= */
+    .editor-palette { display: flex; flex-wrap: wrap; gap: 8px; margin: 15px 0; justify-content: center; }
+    .palette-color { width: 35px; height: 35px; border-radius: 50%; border: 2px solid #ccc; cursor: pointer; transition: transform 0.1s; }
+    .palette-color.active { border: 3px solid #1e293b; transform: scale(1.2); }
+    .editor-tool-toggle { display: flex; gap: 10px; margin-bottom: 15px; }
+    .editor-tool-toggle button { margin: 0; background: #f1f5f9; color: #475569; }
+    .editor-tool-toggle button.active { background: var(--primary); color: #fff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🌊 Ripple Effect</h1>
+    <div id="user-status">🔴 Connecting...</div>
+  </header>
+  
+  <main>
+    <!-- AUTH -->
+    <section id="auth-section">
+      <div class="card">
+        <h2>Welcome Back</h2>
+        <input type="text" id="username" placeholder="Username">
+        <input type="password" id="password" placeholder="Password">
+        <button onclick="login()">Login</button>
+        <button class="secondary" onclick="register()">Create Account</button>
+        <hr>
+        <button class="secondary" onclick="guestMode()" style="background: #e0e7ff; color: #3730a3;">Play as Guest</button>
+      </div>
+    </section>
+
+    <!-- LOBBY -->
+    <section id="lobby-section" style="display:none">
+      <div class="card">
+        <h2>Game Lobby</h2>
+        <button onclick="createRoom()">➕ Create Party Room</button>
+        <div style="display: flex; gap: 10px; margin-top: 10px;">
+          <input type="text" id="party-code" placeholder="Party Code" maxlength="6" style="text-transform:uppercase; margin:0;">
+          <button onclick="joinRoom()" style="margin:0; width:auto;">Join</button>
+        </div>
+        <hr>
+        <button onclick="showSolo()" style="background: #10b981;">🧩 Play Solo</button>
+        <button class="accent" onclick="openEditorSetup()">🛠️ Studio (Create Puzzle)</button>
+        <button class="secondary" onclick="showGallery()">📖 Browse Gallery</button>
+        <button class="secondary" onclick="logout()" style="margin-top: 15px;">Logout</button>
+      </div>
+    </section>
+
+    <!-- WAITING ROOM -->
+    <section id="waiting-section" style="display:none">
+      <div class="card" style="max-width:460px">
+        <h2>⏳ Waiting Room</h2>
+        <p>Invite friends using this code:</p>
+        <div class="party-code-display" id="waiting-code">------</div>
+        <p>Players joined: <strong id="waiting-count">1</strong></p>
+        <button id="start-party-btn" onclick="startParty()" style="display:none; background: #10b981;">▶ Start Game</button>
+        <p style="color:var(--text-muted); font-weight:500;" id="waiting-hint">Waiting for host to start the game...</p>
+        <button class="secondary" onclick="leaveRoom()">← Leave Room</button>
+      </div>
+    </section>
+
+    <!-- GAME -->
+    <section id="game-section" style="display:none">
+      <div class="topbar">
+        <button class="secondary back-btn" onclick="leaveRoom()">← Leave</button>
+        <div id="room-info" style="font-weight: 600; font-size: 18px;"></div>
+        <div id="timer">00:00</div>
+      </div>
+      
+      <div class="game-layout">
+        <div class="board-area">
+          <div id="board-container" class="board-container"></div>
+          <div id="controls">
+            <button class="secondary" onclick="getHint()" id="hint-btn">💡 Hint (5)</button>
+            <button class="secondary" onclick="solveAuto()">🤖 Auto-Solve</button>
+            <button onclick="checkBoard()">✅ Check Board</button>
+          </div>
+        </div>
+        <div class="leaderboard-area">
+          <h3>Live Standings</h3>
+          <ul id="leaderboard"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- RESULTS -->
+    <section id="results-section" style="display:none">
+      <div class="card" style="max-width: 600px;">
+        <h2 style="font-size: 32px; margin-bottom: 5px;">🎉 Match Complete!</h2>
+        <p style="color: var(--text-muted); margin-top:0;">Here are the final standings</p>
+        <ul id="final-ranking" class="podium-list"></ul>
+        <button onclick="backToLobby()" style="padding: 16px; font-size: 18px;">Return to Lobby</button>
+      </div>
+    </section>
+
+    <!-- GALLERY -->
+    <section id="gallery-section" style="display:none">
+      <div class="topbar">
+        <button class="secondary back-btn" onclick="backToLobby()">← Back</button>
+        <h2 style="margin:0;">Public Gallery</h2>
+        <div style="width: 80px;"></div> 
+      </div>
+      <div id="gallery-grid"></div>
+    </section>
+
+    <!-- EDITOR: SETUP -->
+    <section id="editor-setup-section" style="display:none">
+      <div class="card">
+        <h2>🛠️ Studio Setup</h2>
+        <input type="text" id="edit-title" placeholder="Name your puzzle (e.g., 'Tricky Fives')">
+        <select id="edit-size">
+          <option value="3">3 x 3 Grid</option>
+          <option value="4">4 x 4 Grid</option>
+          <option value="5" selected>5 x 5 Grid</option>
+          <option value="6">6 x 6 Grid</option>
+          <option value="7">7 x 7 Grid</option>
+          <option value="8">8 x 8 Grid</option>
+          <option value="9">9 x 9 Grid</option>
+        </select>
+        <button class="accent" onclick="startEditor()">Create Canvas</button>
+        <button class="secondary" onclick="backToLobby()">Cancel</button>
+      </div>
+    </section>
+
+    <!-- EDITOR: WORKSPACE -->
+    <section id="editor-workspace-section" style="display:none">
+      <div class="topbar">
+        <button class="secondary back-btn" onclick="backToLobby()">← Discard</button>
+        <div style="font-weight: 600; font-size: 18px;">Studio: <span id="editor-title-display"></span></div>
+        <div style="width: 80px;"></div>
+      </div>
+      
+      <div class="game-layout">
+        <div class="board-area">
+          <div id="editor-board" class="board-container"></div>
+        </div>
+        
+        <div class="leaderboard-area" style="text-align: center;">
+          <h3>Editing Tools</h3>
+          
+          <div class="editor-tool-toggle">
+            <button id="tool-paint" class="active" onclick="setEditorTool('paint')">🎨 Paint Rooms</button>
+            <button id="tool-number" onclick="setEditorTool('number')">1️⃣ Set Hints</button>
+          </div>
+          
+          <div id="palette-container">
+            <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 5px;">Select a room color, then click cells on the board to group them together.</p>
+            <div id="editor-palette" class="editor-palette"></div>
+          </div>
+          
+          <div id="number-container" style="display:none;">
+            <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 5px;">Click cells to type in starting numbers (or type 0 to clear). Leave cells empty for players to solve.</p>
+          </div>
+
+          <hr>
+          <button style="background: var(--success);" onclick="validatePuzzle()">✅ Validate & Publish</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    let ws = null;
+    let currentToken = localStorage.getItem('token') || null;
+    let currentUser = null;
+    let currentRoom = null;
+    let isHost = false;
+    let gameActive = false;
+    let currentBoard = null;
+    let elapsedSec = 0;
+    let timerInterval = null;
+    let hintsLeft = 5;
+    window.lastLeaderboard = []; 
+
+    // EDITOR STATE
+    let edBoard = null;
+    let edTool = 'paint'; 
+    let edActiveRoom = 1;
+
+    function connect() {
+        let protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(protocol + '//' + window.location.hostname + ':8081', 'ripple-protocol');
+        ws.onopen = () => document.getElementById('user-status').textContent = '🟢 Connected. Please Login.';
+        
+        ws.onmessage = (e) => {
+            let msgs = e.data.split('\n');
+            msgs.forEach(m => {
+                if (m.trim()) {
+                    try {
+                        handleMessage(JSON.parse(m));
+                    } catch(err) {
+                        console.error("JSON Error:", err, m);
+                    }
+                }
+            });
+        };
+        
+        ws.onclose = () => document.getElementById('user-status').textContent = '🔴 Connection Lost';
+    }
+
+    function wsSend(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+    
+    function showSection(id) { 
+        ['auth-section', 'lobby-section', 'waiting-section', 'game-section', 'results-section', 'gallery-section', 'editor-setup-section', 'editor-workspace-section'].forEach(sec => {
+            document.getElementById(sec).style.display = (sec === id) ? 'block' : 'none';
+        });
+    }
+
+    window.onload = connect;
+
+    function login() { wsSend({type: 'login', username: document.getElementById('username').value.trim(), password: document.getElementById('password').value}); }
+    function register() { wsSend({type: 'register', username: document.getElementById('username').value.trim(), password: document.getElementById('password').value}); }
+    function guestMode() { wsSend({type: 'guest'}); }
+    function logout() { if (currentToken) wsSend({type: 'logout', token: currentToken}); currentToken = null; currentUser = null; localStorage.removeItem('token'); showSection('auth-section'); }
+    
+    function createRoom() { wsSend({type: 'create_room', puzzle_id: 0}); }
+    function showSolo() { wsSend({type: 'start_game', puzzle_id: 0}); }
+    function showGallery() { showSection('gallery-section'); wsSend({type: 'gallery_list'}); }
+    function joinRoom() { wsSend({type: 'join_room', code: document.getElementById('party-code').value.trim().toUpperCase()}); }
+    function startParty() { if (isHost) wsSend({type: 'start_party'}); }
+    
+    function leaveRoom() { 
+        if (gameActive && !confirm('Leave the room?')) return; 
+        gameActive = false; clearInterval(timerInterval); wsSend({type: 'leave_room'}); showSection('lobby-section'); 
+    }
+    function backToLobby() { showSection('lobby-section'); }
+
+    // --- EDITOR LOGIC ---
+    function openEditorSetup() { document.getElementById('edit-title').value = ''; showSection('editor-setup-section'); }
+
+    function startEditor() {
+        let title = document.getElementById('edit-title').value.trim() || 'Untitled Puzzle';
+        let size = parseInt(document.getElementById('edit-size').value);
+        document.getElementById('editor-title-display').textContent = title;
+        
+        edBoard = { title: title, size: size, cells: [], rooms: [], given: [] };
+        for(let r=0; r<size; r++) {
+            edBoard.cells[r] = []; edBoard.rooms[r] = []; edBoard.given[r] = [];
+            for(let c=0; c<size; c++) {
+                edBoard.cells[r][c] = 0; edBoard.given[r][c] = 0; edBoard.rooms[r][c] = 1; 
+            }
+        }
+        
+        let maxRooms = Math.floor((size * size) / 2) + 2; 
+        let pal = document.getElementById('editor-palette'); pal.innerHTML = '';
+        for(let i=1; i<=maxRooms; i++) {
+            let col = document.createElement('div');
+            col.className = 'palette-color' + (i===1 ? ' active' : '');
+            let hue = (i * 137.508) % 360;
+            col.style.backgroundColor = `hsl(${hue}, 60%, 85%)`;
+            col.onclick = () => { document.querySelectorAll('.palette-color').forEach(el => el.classList.remove('active')); col.classList.add('active'); edActiveRoom = i; };
+            pal.appendChild(col);
+        }
+        
+        setEditorTool('paint'); renderEditor(); showSection('editor-workspace-section');
+    }
+
+    function setEditorTool(tool) {
+        edTool = tool;
+        document.getElementById('tool-paint').classList.toggle('active', tool === 'paint');
+        document.getElementById('tool-number').classList.toggle('active', tool === 'number');
+        document.getElementById('palette-container').style.display = tool === 'paint' ? 'block' : 'none';
+        document.getElementById('number-container').style.display = tool === 'number' ? 'block' : 'none';
+    }
+
+    function renderEditor() {
+        let container = document.getElementById('editor-board');
+        container.innerHTML = ''; container.style.gridTemplateColumns = `repeat(${edBoard.size}, 55px)`;
+        
+        for (let r = 0; r < edBoard.size; r++) {
+            for (let c = 0; c < edBoard.size; c++) {
+                let cell = document.createElement('div'); cell.className = 'cell';
+                if (edBoard.cells[r][c] > 0) { cell.textContent = edBoard.cells[r][c]; cell.classList.add('given'); }
+                
+                let hue = (edBoard.rooms[r][c] * 137.508) % 360;
+                cell.style.backgroundColor = `hsl(${hue}, 60%, 90%)`;
+
+                if (c < edBoard.size - 1 && edBoard.rooms[r][c] !== edBoard.rooms[r][c+1]) cell.style.borderRight = '4px solid #1e293b';
+                if (r < edBoard.size - 1 && edBoard.rooms[r][c] !== edBoard.rooms[r+1][c]) cell.style.borderBottom = '4px solid #1e293b';
+
+                cell.onmousedown = (e) => {
+                    if (edTool === 'paint') { edBoard.rooms[r][c] = edActiveRoom; renderEditor(); } 
+                    else if (edTool === 'number') {
+                        let input = prompt(`Enter starting number (1-${edBoard.size}), or 0 to clear:`, edBoard.cells[r][c]);
+                        if (input !== null) {
+                            let num = parseInt(input.trim());
+                            if (!isNaN(num) && num >= 0 && num <= edBoard.size) { edBoard.cells[r][c] = num; renderEditor(); }
+                        }
+                    }
+                };
+                
+                cell.onmouseenter = (e) => { if (e.buttons === 1 && edTool === 'paint') { edBoard.rooms[r][c] = edActiveRoom; renderEditor(); } };
+                container.appendChild(cell);
+            }
+        }
+    }
+
+    function validatePuzzle() {
+        let cFlat = [], rFlat = [];
+        for(let r=0; r<edBoard.size; r++) {
+            for(let c=0; c<edBoard.size; c++) {
+                cFlat.push(edBoard.cells[r][c]); rFlat.push(edBoard.rooms[r][c]);
+            }
+        }
+        wsSend({ type: 'validate_puzzle', size: edBoard.size, title: edBoard.title, cells_flat: cFlat.join(','), rooms_flat: rFlat.join(',') });
+    }
+
+    // --- GAME LOGIC ---
+    function startTimer(initial) {
+        elapsedSec = initial || 0; clearInterval(timerInterval);
+        timerInterval = setInterval(() => {
+            elapsedSec++; document.getElementById('timer').textContent = String(Math.floor(elapsedSec / 60)).padStart(2, '0') + ':' + String(elapsedSec % 60).padStart(2, '0');
+        }, 1000);
+    }
+
+    function getHint() { if (!gameActive) return; if (hintsLeft <= 0) return alert('No hints left!'); wsSend({type: 'hint'}); }
+    function solveAuto() { wsSend({type: 'auto_solve'}); }
+    function checkBoard() { wsSend({type: 'check_board'}); }
+
+    function renderBoard(board) {
+        let container = document.getElementById('board-container');
+        if (container.children.length !== board.size * board.size) {
+            container.innerHTML = '';
+            container.style.gridTemplateColumns = `repeat(${board.size}, 55px)`;
+            for (let r = 0; r < board.size; r++) {
+                for (let c = 0; c < board.size; c++) {
+                    let isGiven = board.given[r][c];
+                    let cell = isGiven ? document.createElement('div') : document.createElement('input');
+                    cell.className = 'cell'; cell.id = `cell-${r}-${c}`; cell.dataset.r = r; cell.dataset.c = c;
+                    
+                    if (isGiven) cell.classList.add('given');
+                    else { cell.type = 'text'; cell.inputMode = 'numeric'; cell.maxLength = 1; }
+
+                    let hue = (board.rooms[r][c] * 137.508) % 360;
+                    cell.style.backgroundColor = `hsl(${hue}, 60%, 90%)`;
+
+                    if (c < board.size - 1 && board.rooms[r][c] !== board.rooms[r][c+1]) cell.style.borderRight = '4px solid #1e293b';
+                    if (r < board.size - 1 && board.rooms[r][c] !== board.rooms[r+1][c]) cell.style.borderBottom = '4px solid #1e293b';
+
+                    if (!isGiven) {
+                        cell.oninput = (e) => {
+                            if (!gameActive) { e.target.value = ''; return; }
+                            e.target.classList.remove('error');
+                            let num = parseInt(e.target.value.trim());
+                            if (e.target.value.trim() === '' || e.target.value.trim() === '0') wsSend({type: 'move', row: r, col: c, value: 0});
+                            else if (!isNaN(num) && num > 0 && num <= board.size) wsSend({type: 'move', row: r, col: c, value: num});
+                            else e.target.value = ''; 
+                        };
+                    }
+                    container.appendChild(cell);
+                }
+            }
+        }
+        for (let r = 0; r < board.size; r++) {
+            for (let c = 0; c < board.size; c++) {
+                let cell = document.getElementById(`cell-${r}-${c}`);
+                if (!cell) continue;
+                let val = board.cells[r][c] > 0 ? board.cells[r][c] : '';
+                if (document.activeElement !== cell) {
+                    // This handles assigning the value safely regardless if it's an Input or Div
+                    if (board.given[r][c] || cell.tagName === 'DIV') cell.textContent = val;
+                    else cell.value = val;
+                }
+            }
+        }
+    }
+
+    function handleMessage(msg) {
+        switch (msg.type) {
+            case 'login_ok':
+                currentToken = msg.token; currentUser = msg.user; localStorage.setItem('token', msg.token);
+                document.getElementById('user-status').textContent = `👤 ${msg.user.username} 🟢`; showSection('lobby-section'); break;
+            case 'guest_ok':
+                currentUser = { id: -1, username: msg.username }; document.getElementById('user-status').textContent = `👤 ${msg.username} 🟢`; showSection('lobby-section'); break;
+            case 'login_fail': alert('Wrong username or password'); break;
+            case 'register_ok': alert('Account Created! You can now log in.'); break;
+            
+            case 'room_created':
+                isHost = true; currentRoom = msg.code; document.getElementById('waiting-code').textContent = msg.code;
+                document.getElementById('waiting-count').textContent = '1'; document.getElementById('start-party-btn').style.display = 'block';
+                document.getElementById('waiting-hint').style.display = 'none'; showSection('waiting-section'); break;
+            case 'room_joined':
+                isHost = false; currentRoom = msg.code; document.getElementById('waiting-code').textContent = msg.code;
+                document.getElementById('start-party-btn').style.display = 'none'; document.getElementById('waiting-hint').style.display = 'block';
+                showSection('waiting-section'); break;
+            case 'room_update': document.getElementById('waiting-count').textContent = msg.players; break;
+                
+            case 'game_start':
+                gameActive = true; currentBoard = msg.board; hintsLeft = 5; window.lastLeaderboard = [];
+                if (msg.code) currentRoom = msg.code;
+                else if (typeof msg.code !== 'undefined' && msg.code === '') currentRoom = null; 
+                
+                document.getElementById('controls').innerHTML = `
+                    <button class="secondary" onclick="getHint()" id="hint-btn">💡 Hint (5)</button>
+                    <button class="secondary" onclick="solveAuto()">🤖 Auto-Solve</button>
+                    <button onclick="checkBoard()">✅ Check Board</button>
+                `;
+                document.getElementById('room-info').innerHTML = currentRoom ? `Room: <span style="color:var(--primary)">${currentRoom}</span>` : 'Solo Play';
+                document.getElementById('leaderboard').innerHTML = '<li>Waiting for players...</li>';
+                showSection('game-section'); renderBoard(currentBoard); startTimer(0); break;
+            
+            case 'board_update':
+                if (currentBoard && msg.board) { currentBoard = msg.board; renderBoard(currentBoard); }
+                break;
+                
+            case 'move_ok': if (currentBoard) { currentBoard.cells[msg.row][msg.col] = msg.value; renderBoard(currentBoard); } break;
+            
+            case 'hint_ok':
+                if (currentBoard) {
+                    hintsLeft--; document.getElementById('hint-btn').textContent = `💡 Hint (${hintsLeft})`;
+                    currentBoard.cells[msg.row][msg.col] = msg.value; renderBoard(currentBoard);
+                    let cell = document.getElementById(`cell-${msg.row}-${msg.col}`);
+                    if (cell) {
+                        cell.style.transition = 'none'; cell.style.backgroundColor = '#fbbf24'; cell.style.transform = 'scale(1.15)'; cell.style.color = '#000';
+                        setTimeout(() => {
+                            cell.style.transition = 'all 0.6s ease'; cell.style.transform = 'scale(1)'; cell.style.color = 'var(--primary)';
+                            cell.style.backgroundColor = `hsl(${(currentBoard.rooms[msg.row][msg.col] * 137.508) % 360}, 60%, 90%)`;
+                        }, 600);
+                    }
+                }
+                break;
+            
+            case 'check_result':
+                if (msg.errors && msg.errors.length > 0) {
+                    renderBoard(currentBoard); 
+                    msg.errors.forEach(err => { let cell = document.getElementById(`cell-${err.r}-${err.c}`); if (cell) cell.classList.add('error'); });
+                } else { document.querySelectorAll('.cell.error').forEach(el => el.classList.remove('error')); }
+                break;
+                
+            case 'board_solved':
+                gameActive = false; clearInterval(timerInterval); document.getElementById('timer').textContent = `${msg.time}s`;
+                document.getElementById('room-info').innerHTML = `<span style="color: var(--success);">🎉 Finished! Waiting for others...</span>`;
+                
+                // Div replacement is back and 100% reliable for rendering the solved answers!
+                for (let r = 0; r < currentBoard.size; r++) {
+                    for (let c = 0; c < currentBoard.size; c++) {
+                        let cell = document.getElementById(`cell-${r}-${c}`);
+                        if (cell && cell.tagName === 'INPUT') {
+                            let div = document.createElement('div');
+                            div.className = cell.className + ' solved-text'; 
+                            div.id = cell.id;
+                            div.style.cssText = cell.style.cssText;
+                            div.textContent = currentBoard.cells[r][c] > 0 ? currentBoard.cells[r][c] : '';
+                            cell.replaceWith(div);
+                        }
+                    }
+                }
+                break;
+
+            case 'game_over':
+                gameActive = false; clearInterval(timerInterval);
+                document.getElementById('room-info').innerHTML = `<span style="color: var(--success);">🎉 Everyone Finished!</span>`;
+                
+                document.getElementById('controls').innerHTML = `
+                    <button class="accent" onclick="showSection('results-section')" style="font-size: 18px; padding: 15px;">🏆 View Final Standings</button>
+                `;
+                
+                let rankList = document.getElementById('final-ranking'); rankList.innerHTML = '';
+                let sorted = (window.lastLeaderboard || []).sort((a,b) => a.time - b.time);
+                sorted.forEach((p, index) => {
+                    let li = document.createElement('li');
+                    let medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `<span style="color:#94a3b8; width:25px; display:inline-block;">${index+1}.</span>`;
+                    li.innerHTML = `<span>${medal} ${p.name}</span>`;
+                    rankList.appendChild(li);
+                });
+
+                // Clear the stuck 'Waiting for players...' text
+                let lb = document.getElementById('leaderboard');
+                if(lb && lb.innerHTML.includes('Waiting')) {
+                     lb.innerHTML = '<li><span class="time finished-time">All players finished!</span></li>';
+                }
+                
+                currentRoom = null;
+                break;
+
+            case 'leaderboard':
+                window.lastLeaderboard = msg.players;
+                let list = document.getElementById('leaderboard'); list.innerHTML = '';
+                
+                if (msg.players.length === 0) {
+                    list.innerHTML = '<li>Waiting for players...</li>';
+                    break;
+                }
+
+                let liveSorted = [...msg.players].sort((a,b) => {
+                    if (a.status !== b.status) return b.status - a.status;
+                    return a.time - b.time; 
+                });
+                let rank = 1;
+                liveSorted.forEach(p => {
+                    let item = document.createElement('li');
+                    if (p.status === 1) {
+                        let medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `#${rank}`;
+                        item.innerHTML = `<span>${medal} ${p.name}</span> <span class="time finished-time">${p.time}s</span>`;
+                        rank++;
+                    } else { item.innerHTML = `<span>⏳ ${p.name}</span> <span class="time">Solving...</span>`; }
+                    list.appendChild(item);
+                });
+                break;
+
+            case 'gallery_data':
+                let grid = document.getElementById('gallery-grid'); grid.innerHTML = '';
+                if (!msg.puzzles || msg.puzzles.length === 0) return grid.innerHTML = '<p>No puzzles found.</p>';
+                msg.puzzles.forEach(p => {
+                    let card = document.createElement('div'); card.className = 'gallery-card';
+                    card.innerHTML = `<div><strong style="display:block; font-size:18px;">${p.title}</strong><span style="color:var(--text-muted); font-size:14px;">${p.size}x${p.size} Grid</span></div><button onclick="wsSend({type:'start_game', puzzle_id:${p.id}})">▶ Play</button>`;
+                    grid.appendChild(card);
+                });
+                break;
+            
+            case 'validate_ok':
+                if(confirm("Awesome! Your puzzle has a valid solution.\n\nDo you want to publish it to the Public Gallery?")) {
+                    let cFlat = [], rFlat = [];
+                    for(let r=0; r<edBoard.size; r++) {
+                        for(let c=0; c<edBoard.size; c++) {
+                            cFlat.push(edBoard.cells[r][c]); rFlat.push(edBoard.rooms[r][c]);
+                        }
+                    }
+                    wsSend({ type: 'publish_puzzle', size: edBoard.size, title: edBoard.title, cells_flat: cFlat.join(','), rooms_flat: rFlat.join(',') });
+                }
+                break;
+            case 'validate_fail': alert("Uh oh! The Auto-Solver couldn't find a valid solution. Make sure every cell is covered by a room and the starting numbers don't break any rules."); break;
+            case 'publish_ok': alert("Successfully published! It is now live in the Gallery."); showGallery(); break;
+            case 'error_msg': alert(msg.message); break;
+        }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,3095 @@
+
+
+========================================
+FILE: ./Makefile
+========================================
+CC = gcc
+CFLAGS = -Wall -Wextra -Iadmin/include -g
+LDFLAGS = -lsqlite3 -lwebsockets -lcrypto -lssl -lncurses -lpthread
+
+SRCS = admin/src/main.c admin/src/auth.c admin/src/board.c admin/src/epoll_io.c \
+       admin/src/game.c admin/src/server.c admin/src/signals.c \
+       admin/src/threads.c admin/src/websocket.c \
+       admin/db/database.c admin/db/schema.c \
+       admin/puzzle/editor.c admin/puzzle/loader.c admin/puzzle/validator.c \
+       admin/solver/generator.c admin/solver/solver.c \
+       admin/tui/tui.c
+
+OBJS = $(SRCS:.c=.o)
+TARGET = ripple_server
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+
+========================================
+FILE: ./admin/solver/solver.c
+========================================
+#include "game.h"
+#include "solver.h"
+#include <string.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+static int is_valid(Board *b, int r, int c, int v) {
+    int rid = b->rooms[r][c];
+    if (v > b->room_sizes[rid]) return 0;
+    for (int i=0; i<b->size; i++)
+        for (int j=0; j<b->size; j++)
+            if (b->rooms[i][j]==rid && (i!=r||j!=c) && b->cells[i][j]==v) return 0;
+    for (int cc=0; cc<b->size; cc++)
+        if (cc!=c && b->cells[r][cc]==v && abs(c-cc)<=v) return 0;
+    for (int rr=0; rr<b->size; rr++)
+        if (rr!=r && b->cells[rr][c]==v && abs(r-rr)<=v) return 0;
+    return 1;
+}
+
+static int solve_rec(Board *b) {
+    int br=-1, bc=-1, mm=999, ef=0;
+    for (int r=0; r<b->size; r++) {
+        for (int c=0; c<b->size; c++) {
+            if (b->cells[r][c]==0) {
+                ef=1;
+                int mv=0;
+                for (int v=1; v<=b->room_sizes[b->rooms[r][c]]; v++)
+                    if (is_valid(b,r,c,v)) mv++;
+                if (mv==0) return 0;
+                if (mv<mm) { mm=mv; br=r; bc=c; if (mv==1) goto pick; }
+            }
+        }
+    }
+pick:
+    if (!ef) return 1;
+    for (int v=1; v<=b->room_sizes[b->rooms[br][bc]]; v++) {
+        if (is_valid(b,br,bc,v)) {
+            b->cells[br][bc]=v;
+            if (solve_rec(b)) return 1;
+            b->cells[br][bc]=0;
+        }
+    }
+    return 0;
+}
+
+int solver_solve(Board *b) { return solve_rec(b); }
+
+typedef struct { Board in; Board out; int ok; } SolveJob;
+static void *tfn(void *a) {
+    SolveJob *j=(SolveJob*)a;
+    j->out=j->in; j->ok=solve_rec(&j->out); return NULL;
+}
+
+int solver_run_as_child(Board *b, Board *out) {
+    SolveJob j; j.in=*b; j.ok=0;
+    pthread_t tid;
+    if (pthread_create(&tid,NULL,tfn,&j)!=0) return -1;
+    pthread_join(tid,NULL);
+    if (j.ok) { *out=j.out; return 0; }
+    return -1;
+}
+
+
+========================================
+FILE: ./admin/solver/generator.c
+========================================
+#include "solver.h"
+#include "game.h"
+#include <stdlib.h>
+#include <string.h>
+
+int puzzle_generate(Board *out, int size) {
+    if (!out || size < 3 || size > 6) return 0;
+
+    for (int attempt = 0; attempt < 200000; attempt++) {
+        memset(out, 0, sizeof(Board));
+        out->size = size;
+
+        /* === STEP 1: BUILD BRAND NEW RANDOM ROOMS === */
+        /* Place every cell into a queue, shuffle it, then flood-fill rooms */
+        int order[64]; int n = size * size;
+        for (int i = 0; i < n; i++) order[i] = i;
+        /* Fisher-Yates shuffle for completely random start order */
+        for (int i = n - 1; i > 0; i--) {
+            int j = rand() % (i + 1);
+            int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+        }
+
+        int room_id = 1;
+        for (int k = 0; k < n; k++) {
+            int sr = order[k] / size;
+            int sc = order[k] % size;
+            if (out->rooms[sr][sc] != 0) continue;
+
+            /* Max room size capped at size to avoid giant unsolvable rooms */
+            int max_sz = (size > 4) ? 4 : size;
+            int target = (rand() % max_sz) + 1;
+            int sz = 0;
+            int cr = sr, cc_col = sc;
+
+            while (sz < target) {
+                if (out->rooms[cr][cc_col] == 0) {
+                    out->rooms[cr][cc_col] = room_id;
+                    sz++;
+                }
+                /* Random walk in 4 directions */
+                int dirs[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};
+                /* Shuffle directions for organic shapes */
+                for (int d = 3; d > 0; d--) {
+                    int j = rand() % (d + 1);
+                    int tr = dirs[d][0]; int tc = dirs[d][1];
+                    dirs[d][0] = dirs[j][0]; dirs[d][1] = dirs[j][1];
+                    dirs[j][0] = tr; dirs[j][1] = tc;
+                }
+                int moved = 0;
+                for (int d = 0; d < 4; d++) {
+                    int nr = cr + dirs[d][0], nc = cc_col + dirs[d][1];
+                    if (nr>=0 && nr<size && nc>=0 && nc<size && out->rooms[nr][nc]==0) {
+                        cr = nr; cc_col = nc; moved = 1; break;
+                    }
+                }
+                if (!moved) break;
+            }
+            out->room_sizes[room_id] = sz;
+            room_id++;
+        }
+        out->room_count = room_id - 1;
+
+        /* === STEP 2: VERIFY ROOMS COVER EVERY CELL === */
+        int valid = 1;
+        for (int r = 0; r < size && valid; r++)
+            for (int c = 0; c < size && valid; c++)
+                if (out->rooms[r][c] == 0) valid = 0;
+        if (!valid) continue;
+
+        /* === STEP 3: SOLVE TO FIND VALID NUMBER LAYOUT === */
+        Board solved; memset(&solved, 0, sizeof(Board));
+        if (solver_run_as_child(out, &solved) != 0) continue;
+        if (solved.cells[0][0] == 0) continue; /* Verify solver actually ran */
+
+        /* === STEP 4: PUNCH HOLES TO CREATE THE PLAYABLE PUZZLE === */
+        /* Keep at least 1 given per room so it stays uniquely solvable */
+        memset(out->given, 0, sizeof(out->given));
+        memset(out->cells, 0, sizeof(out->cells));
+
+        for (int rid = 1; rid <= out->room_count; rid++) {
+            /* Guarantee at least one given per room */
+            int best_r = -1, best_c = -1;
+            for (int r = 0; r < size; r++)
+                for (int c = 0; c < size; c++)
+                    if (out->rooms[r][c] == rid) { best_r = r; best_c = c; }
+            if (best_r >= 0) {
+                out->given[best_r][best_c] = 1;
+                out->cells[best_r][best_c] = solved.cells[best_r][best_c];
+            }
+        }
+
+        /* Randomly reveal some extra cells (35% chance) */
+        for (int r = 0; r < size; r++) {
+            for (int c = 0; c < size; c++) {
+                if (!out->given[r][c] && (rand() % 100) < 35) {
+                    out->given[r][c] = 1;
+                    out->cells[r][c] = solved.cells[r][c];
+                }
+            }
+        }
+
+        return 1; /* SUCCESS! Brand new puzzle ready */
+    }
+
+    return 0; /* Failed after 200,000 attempts (should never happen) */
+}
+
+
+========================================
+FILE: ./admin/tui/tui.c
+========================================
+#include "tui.h"
+#include "server.h"
+#include "game.h"
+#include "database.h"
+#include "puzzle.h"
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern Room g_rooms[];
+extern int g_room_count;
+extern Board g_presets[];
+extern int g_preset_count;
+
+void tui_view_rooms(void);
+void tui_view_gallery(void);
+void tui_view_users(void);
+void tui_view_board(const char *party_code);
+
+void tui_init(void) {
+    initscr(); cbreak(); noecho();
+    keypad(stdscr, TRUE); curs_set(0);
+    if (has_colors()) {
+        start_color();
+        init_pair(1, COLOR_CYAN, COLOR_BLACK);
+        init_pair(2, COLOR_GREEN, COLOR_BLACK);
+        init_pair(3, COLOR_YELLOW, COLOR_BLACK);
+        init_pair(4, COLOR_BLUE, COLOR_BLACK);
+    }
+}
+
+void tui_cleanup(void) { endwin(); }
+
+static void draw_menu(int max_y, int max_x) {
+    attron(COLOR_PAIR(1) | A_BOLD);
+    mvprintw(2, (max_x - 30) / 2, "🌊 RIPPLE EFFECT - ADMIN CONSOLE 🌊");
+    attroff(COLOR_PAIR(1) | A_BOLD);
+    mvprintw(5, 4, "[R] View Active Rooms (%d)", g_room_count);
+    mvprintw(6, 4, "[P] Puzzle Gallery Management");
+    mvprintw(7, 4, "[U] User Management");
+    mvprintw(8, 4, "[B] Live Board Viewer");
+    mvprintw(9, 4, "[Q] Quit Server");
+    attron(COLOR_PAIR(2));
+    mvprintw(max_y - 2, 2, "Status: ONLINE | TCP:8080 | WS:8081");
+    attroff(COLOR_PAIR(2));
+}
+
+void tui_run(void) {
+    int max_y, max_x;
+    while (g_running) {
+        clear();
+        getmaxyx(stdscr, max_y, max_x);
+        draw_menu(max_y, max_x);
+        refresh();
+
+        int ch = getch();
+        switch (ch) {
+            case 'q': case 'Q': g_running = 0; break;
+            case 'r': case 'R': tui_view_rooms(); break;
+            case 'p': case 'P': tui_view_gallery(); break;
+            case 'u': case 'U': tui_view_users(); break;
+            case 'b': case 'B': {
+                echo(); curs_set(1);
+                char code[32] = {0};
+                mvprintw(max_y - 1, 0, "Enter Party Code to view: ");
+                getnstr(code, 6);
+                noecho(); curs_set(0);
+                if (strlen(code) > 0) tui_view_board(code);
+                break;
+            }
+        }
+    }
+}
+
+void tui_view_rooms(void) {
+    int rows, cols; getmaxyx(stdscr, rows, cols);
+    WINDOW *win = newwin(rows, cols, 0, 0);
+    keypad(win, TRUE); nodelay(win, TRUE);
+    while (g_running) {
+        werase(win); box(win, 0, 0);
+        mvwprintw(win, 1, 2, " ACTIVE ROOMS (%d) ", g_room_count);
+        mvwprintw(win, 3, 2, "%-10s | %-10s | %-10s", "Room Code", "Players", "Status");
+        mvwprintw(win, 4, 2, "----------------------------------------");
+        for (int i = 0; i < g_room_count && i < rows - 8; i++) {
+            Room *r = &g_rooms[i];
+            const char *st = (r->player_count == 0 && r->status != 0) ? "Leaved" : (r->status == 1 ? "Playing" : (r->status == 2 ? "Won" : "Waiting"));
+            mvwprintw(win, 5 + i, 2, "%-10s | %-10d | %-10s", r->code, r->player_count, st);
+        }
+        mvwprintw(win, rows - 2, 2, " Press 'q' to go back ");
+        wrefresh(win);
+        struct timespec ts = {0, 200000000L}; nanosleep(&ts, NULL);
+        int ch = wgetch(win);
+        if (ch == 'q' || ch == 'Q' || ch == 27) break;
+    }
+    delwin(win); touchwin(stdscr); refresh();
+}
+
+void tui_view_gallery(void) {
+    int rows, cols; getmaxyx(stdscr, rows, cols);
+    WINDOW *win = newwin(rows, cols, 0, 0);
+    werase(win); box(win, 0, 0);
+    mvwprintw(win, 1, 2, " PUZZLE GALLERY (%d loaded) ", g_preset_count);
+    mvwprintw(win, 3, 2, "%-5s | %-25s | %-5s", "ID", "Title", "Size");
+    mvwprintw(win, 4, 2, "--------------------------------------------------");
+    for (int i = 0; i < g_preset_count && i < rows - 8; i++) {
+        mvwprintw(win, 5 + i, 2, "%-5d | %-25s | %dx%d",
+                  g_presets[i].puzzle_id,
+                  g_presets[i].title[0] ? g_presets[i].title : "Unknown",
+                  g_presets[i].size, g_presets[i].size);
+    }
+    mvwprintw(win, rows - 2, 2, " Press any key to go back ");
+    wrefresh(win); wgetch(win); delwin(win); touchwin(stdscr); refresh();
+}
+
+void tui_view_users(void) {
+    int rows, cols; getmaxyx(stdscr, rows, cols);
+    WINDOW *win = newwin(rows, cols, 0, 0);
+    werase(win); box(win, 0, 0);
+    mvwprintw(win, 1, 2, " USER MANAGEMENT ");
+    mvwprintw(win, 3, 2, "Database File: ripple.db");
+    mvwprintw(win, 5, 2, "To view all registered users, run this command in a separate terminal:");
+    wattron(win, COLOR_PAIR(3));
+    mvwprintw(win, 7, 4, "sqlite3 ripple.db 'SELECT id, username FROM users;'");
+    wattroff(win, COLOR_PAIR(3));
+    mvwprintw(win, rows - 2, 2, " Press any key to go back ");
+    wrefresh(win); wgetch(win); delwin(win); touchwin(stdscr); refresh();
+}
+
+void tui_view_board(const char *party_code) {
+    Room *room = game_find_room(party_code);
+    if (!room) {
+        mvprintw(LINES - 1, 0, "Room '%s' not found. Press any key.", party_code);
+        clrtoeol(); refresh(); getch(); return;
+    }
+
+    int rows, cols; getmaxyx(stdscr, rows, cols);
+    WINDOW *bwin = newwin(rows, cols / 2, 0, cols / 2);
+    keypad(bwin, TRUE); nodelay(bwin, TRUE);
+
+    while (g_running) {
+        werase(bwin); box(bwin, 0, 0);
+        mvwprintw(bwin, 1, 2, " Live View: Room %s ", party_code);
+        mvwprintw(bwin, 2, 2, " Players: %d | Status: %s ",
+                  room->player_count,
+                  room->status == 1 ? "Playing" : (room->status == 2 ? "Won" : "Waiting"));
+
+        int start_y = 4, start_x = 4;
+        pthread_mutex_lock(&room->lock);
+        
+        // FIX: Look at the active player board, not the static template
+        Board *b = (room->player_count > 0 && room->player_board_ready[0]) ? &room->player_boards[0] : &room->board;
+        
+        for (int r = 0; r < b->size; r++) {
+            for (int c = 0; c < b->size; c++) {
+                int cell_y = start_y + (r * 2), cell_x = start_x + (c * 4);
+                if (b->cells[r][c] > 0) {
+                    if (b->given[r][c]) wattron(bwin, COLOR_PAIR(3));
+                    mvwprintw(bwin, cell_y, cell_x, " %d ", b->cells[r][c]);
+                    if (b->given[r][c]) wattroff(bwin, COLOR_PAIR(3));
+                } else mvwprintw(bwin, cell_y, cell_x, " . ");
+
+                if (c < b->size - 1) {
+                    if (b->rooms[r][c] != b->rooms[r][c+1]) {
+                        wattron(bwin, COLOR_PAIR(4) | A_BOLD);
+                        mvwprintw(bwin, cell_y, cell_x + 3, "|");
+                        wattroff(bwin, COLOR_PAIR(4) | A_BOLD);
+                    } else mvwprintw(bwin, cell_y, cell_x + 3, " ");
+                }
+                if (r < b->size - 1) {
+                    if (b->rooms[r][c] != b->rooms[r+1][c]) {
+                        wattron(bwin, COLOR_PAIR(4) | A_BOLD);
+                        mvwprintw(bwin, cell_y + 1, cell_x, "---");
+                        wattroff(bwin, COLOR_PAIR(4) | A_BOLD);
+                    } else mvwprintw(bwin, cell_y + 1, cell_x, "   ");
+                }
+            }
+        }
+        pthread_mutex_unlock(&room->lock);
+
+        mvwprintw(bwin, rows - 2, 2, " Press 'q' to exit ");
+        wrefresh(bwin);
+        struct timespec ts = {0, 100000000L}; nanosleep(&ts, NULL);
+        int ch = wgetch(bwin);
+        if (ch == 'q' || ch == 'Q' || ch == 27) break;
+    }
+    nodelay(bwin, FALSE); delwin(bwin); touchwin(stdscr); refresh();
+}
+
+
+========================================
+FILE: ./admin/include/database.h
+========================================
+#ifndef DATABASE_H
+#define DATABASE_H
+#include <sqlite3.h>
+#include "ripple.h"
+
+int  db_open(const char *path);
+void db_close(void);
+int  db_init_schema(void);
+
+int db_create_user(const char *username, const char *pwhash);
+int  db_get_user(const char *username, User *out);
+int  db_update_stats(int user_id, int size, int solve_time, int won);
+
+int  db_save_session(const char *token, int user_id, long expires_at);
+int  db_get_session(const char *token, Session *out);
+int  db_delete_session(const char *token);
+
+int  db_save_puzzle(Board *b, int author_id, int is_verified);
+int  db_get_puzzle(int puzzle_id, Board *out);
+int  db_list_gallery(int offset, int limit, Board *out, int *count);
+int  db_rate_puzzle(int puzzle_id, int player_id, int stars);
+int  db_verify_puzzle(int puzzle_id);
+int  db_delete_puzzle(int puzzle_id);
+
+int  db_save_game(int player_id, Board *b, int elapsed_sec);
+int  db_load_game(int player_id, Board *out, int *elapsed_sec);
+
+int  db_get_leaderboard(int puzzle_id, int limit, int *player_ids, int *times);
+
+extern sqlite3 *g_db;
+#endif
+
+
+========================================
+FILE: ./admin/include/tui.h
+========================================
+#ifndef TUI_H
+#define TUI_H
+#include <ncurses.h>
+void tui_init(void);
+void tui_cleanup(void);
+void tui_run(void);
+void tui_draw_rooms(WINDOW *win);
+void tui_draw_leaderboard(WINDOW *win);
+void tui_draw_gallery(WINDOW *win);
+void tui_draw_stats(WINDOW *win);
+void tui_handle_input(int ch);
+void tui_kick_player(const char *party_code, int player_id);
+void tui_approve_puzzle(int puzzle_id);
+void tui_delete_puzzle(int puzzle_id);
+#endif
+
+
+========================================
+FILE: ./admin/include/server.h
+========================================
+#ifndef SERVER_H
+#define SERVER_H
+#include "ripple.h"
+typedef struct {
+    int socket_fd;
+    int user_id;
+    char session_token[65];
+    Room *room;
+    pthread_t thread;
+} PlayerConn;
+
+int  server_start(int port);
+void server_stop(void);
+void *player_thread(void *arg);
+void  server_broadcast(Room *room, const char *msg);
+void  server_send(PlayerConn *pc, const char *msg);
+#endif
+
+
+========================================
+FILE: ./admin/include/auth.h
+========================================
+#ifndef AUTH_H
+#define AUTH_H
+int  auth_hash_password(const char *password, char *out_hex65);
+int  auth_generate_token(char *out_hex65);
+int  auth_register(const char *username, const char *password);
+int  auth_login(const char *username, const char *password, char *out_token);
+int  auth_validate_token(const char *token, int *out_user_id);
+int  auth_logout(const char *token);
+#endif
+
+
+========================================
+FILE: ./admin/include/game.h
+========================================
+#ifndef GAME_H
+#define GAME_H
+#include "ripple.h"
+int  game_is_valid_move(Board *b, int row, int col, int val);
+int  game_is_solved(Board *b);
+int  game_make_move(Board *b, int row, int col, int val, pthread_mutex_t *lock, sem_t *cell_sems);
+void game_reset_board(Board *b);
+int  game_create_room(int host_id, int puzzle_id, char *out_code);
+Room *game_find_room(const char *code);
+int  game_join_room(const char *code, int player_id);
+void game_start(Room *room);
+void game_finish(Room *room, int winner_id);
+#endif
+
+
+========================================
+FILE: ./admin/include/solver.h
+========================================
+#ifndef SOLVER_H
+#define SOLVER_H
+#include "ripple.h"
+int solver_solve(Board *b);
+int solver_generate(Board *b, int size, int difficulty);
+int solver_run_as_child(Board *b, Board *out_solved);
+int puzzle_generate(Board *out_board, int size);
+#endif
+
+
+========================================
+FILE: ./admin/include/ripple.h
+========================================
+#ifndef RIPPLE_H
+#define RIPPLE_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/mman.h>
+#include <time.h>
+
+#define MAX_BOARD_SIZE      9
+#define MAX_PLAYERS         8
+#define MAX_ROOMS           64
+#define MAX_ROOMS_PER_BOARD 64
+#define TOKEN_LEN           32
+#define PARTY_CODE_LEN      6
+
+typedef struct {
+    int  size;
+    int  cells[MAX_BOARD_SIZE][MAX_BOARD_SIZE];
+    int  given[MAX_BOARD_SIZE][MAX_BOARD_SIZE];
+    int  rooms[MAX_BOARD_SIZE][MAX_BOARD_SIZE];
+    int  room_sizes[MAX_ROOMS_PER_BOARD + 1];
+    int  room_count;
+    char title[64];
+    int  puzzle_id;
+} Board;
+
+typedef struct {
+    int  id;
+    char username[64];
+    char password_hash[65];
+    int  best_times[MAX_BOARD_SIZE + 1];
+    int  total_wins;
+    int  total_games;
+} User;
+
+typedef struct {
+    char token[TOKEN_LEN * 2 + 1];
+    int  user_id;
+    long expires_at;
+} Session;
+
+typedef struct {
+    char   code[PARTY_CODE_LEN + 1];
+    int    host_id;
+    int    puzzle_id;
+    int    player_ids[MAX_PLAYERS];
+    int    player_count;
+    Board  board;                      /* initial shared board (preset) */
+    int    status;
+    time_t start_time;
+    pthread_mutex_t lock;
+
+    /* Leaderboard */
+    int    player_status[MAX_PLAYERS];      /* 0 solving, 1 finished */
+    time_t player_finish_time[MAX_PLAYERS];
+    char   player_names[MAX_PLAYERS][64];
+
+    /* Isolated per‑player boards */
+    Board  player_boards[MAX_PLAYERS];
+    int    player_board_ready[MAX_PLAYERS]; /* 1 when board is initialised */
+} Room;
+
+extern Room              g_rooms[MAX_ROOMS];
+extern int               g_room_count;
+extern pthread_mutex_t   g_rooms_lock;
+extern volatile sig_atomic_t g_running;
+
+#endif /* RIPPLE_H */
+
+
+========================================
+FILE: ./admin/include/puzzle.h
+========================================
+#ifndef PUZZLE_H
+#define PUZZLE_H
+#include "ripple.h"
+int puzzle_load_file(const char *path, Board *boards, int max_count);
+int puzzle_save_file(const char *path, Board *b);
+int puzzle_validate(Board *b);
+int puzzle_editor_run(Board *b);
+#endif
+
+
+========================================
+FILE: ./admin/src/main.c
+========================================
+#include "ripple.h"
+#include "database.h"
+#include "server.h"
+#include "tui.h"
+#include "puzzle.h"
+#include "game.h"
+#include <getopt.h>
+#include <signal.h>
+
+volatile sig_atomic_t g_running    = 1;
+Room                  g_rooms[MAX_ROOMS];
+int                   g_room_count = 0;
+pthread_mutex_t       g_rooms_lock = PTHREAD_MUTEX_INITIALIZER;
+
+extern Board g_presets[];
+extern int   g_preset_count;
+
+void websocket_start(int port);
+void websocket_stop(void);
+
+static void handle_sigterm(int s) { (void)s; g_running = 0; }
+static void handle_sigalrm(int s) {
+    (void)s;
+    fprintf(stderr, "[SIGALRM] Rest reminder\n");
+    alarm(300);
+}
+
+int main(int argc, char *argv[]) {
+    int  port = 8080;
+    char db_path[256]     = "ripple.db";
+    char puzzle_file[256] = "";
+
+    static struct option long_opts[] = {
+        {"port", required_argument, 0, 'p'},
+        {"db",   required_argument, 0, 'd'},
+        {"size", required_argument, 0, 's'},
+        {0,0,0,0}
+    };
+    int opt, idx = 0;
+    while ((opt = getopt_long(argc, argv, "p:d:s:f:", long_opts, &idx)) != -1) {
+        switch (opt) {
+            case 'p': port = atoi(optarg);               break;
+            case 'd': strncpy(db_path,     optarg, 255); break;
+            case 'f': strncpy(puzzle_file, optarg, 255); break;
+            case 's': break;
+        }
+    }
+
+    signal(SIGTERM, handle_sigterm);
+    signal(SIGALRM, handle_sigalrm);
+    signal(SIGPIPE, SIG_IGN);
+    alarm(300);
+
+    db_open(db_path);
+    db_init_schema();
+
+    if (puzzle_file[0]) {
+        g_preset_count = puzzle_load_file(puzzle_file, g_presets, 16);
+        fprintf(stdout, "[INFO] Loaded %d puzzle(s) from %s\n",
+                g_preset_count, puzzle_file);
+        for (int i = 0; i < g_preset_count; i++)
+            fprintf(stdout, "  [%d] '%s' %dx%d\n",
+                    i+1, g_presets[i].title,
+                    g_presets[i].size, g_presets[i].size);
+    }
+
+    server_start(port);
+    websocket_start(port + 1);
+    fprintf(stdout, "[INFO] TCP=%d  WS=%d  DB=%s\n", port, port+1, db_path);
+
+    tui_init();
+    tui_run();
+    tui_cleanup();
+
+    websocket_stop();
+    server_stop();
+    db_close();
+    return 0;
+}
+
+
+========================================
+FILE: ./admin/src/epoll_io.c
+========================================
+#include "ripple.h"
+#include <sys/epoll.h>
+#include <stdio.h>
+
+/* Thin helpers around epoll for the accept loop in server.c */
+int epoll_add(int epfd, int fd, uint32_t events) {
+    struct epoll_event ev = { .events = events, .data.fd = fd };
+    return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+int epoll_del(int epfd, int fd) {
+    return epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+}
+
+
+========================================
+FILE: ./admin/src/websocket.c
+========================================
+#include "ripple.h"
+#include "server.h"
+#include "game.h"
+#include "auth.h"
+#include "database.h"
+#include "solver.h"
+#include "puzzle.h"
+#include <libwebsockets.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <time.h>
+#include <pthread.h>
+
+typedef struct {
+    int  user_id;
+    int  conn_id;
+    char username[64];
+    char session_token[65];
+    Room *room;
+    int   is_host;
+    char  pending[4096];
+    int   pending_len;
+    char  out_buf[8192];
+    int   out_len;
+    int   out_ready;
+} WsSession;
+
+static int g_conn_counter = 0;
+
+static void broadcast_leaderboard(Room *r);
+static void handle_msg(struct lws *wsi, WsSession *sess, const char *msg);
+
+static int jstr(const char *j, const char *k, char *out, int max) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\"", k);
+    const char *p = strstr(j, search);
+    if (!p) return 0;
+    p += strlen(search);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p == '"') p++;
+    int i = 0;
+    while (*p && *p != '"' && i < max - 1) { out[i++] = *p++; }
+    out[i] = 0;
+    return 1;
+}
+
+static int jint(const char *j, const char *k, int *out) {
+    char s[64]; snprintf(s, sizeof(s), "\"%s\":", k);
+    const char *p = strstr(j, s);
+    if (!p) return 0;
+    p += strlen(s); while (*p == ' ') p++;
+    *out = atoi(p); return 1;
+}
+
+// NEW: Safely append messages to the buffer instead of overwriting
+static void append_to_out_buf(WsSession *s, const char *raw) {
+    int raw_len = strlen(raw);
+    if (s->out_len > 0) {
+        if (s->out_len + raw_len + 2 < (int)sizeof(s->out_buf)) {
+            s->out_buf[s->out_len] = '\n';
+            strcpy(s->out_buf + s->out_len + 1, raw);
+            s->out_len += raw_len + 1;
+        }
+    } else {
+        if (raw_len < (int)sizeof(s->out_buf)) {
+            strcpy(s->out_buf, raw);
+            s->out_len = raw_len;
+        }
+    }
+    s->out_ready = 1;
+}
+
+static void ws_queue(struct lws *wsi, WsSession *sess, const char *fmt, ...) {
+    char raw[4096];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(raw, sizeof(raw), fmt, ap);
+    va_end(ap);
+    
+    append_to_out_buf(sess, raw);
+    lws_callback_on_writable(wsi);
+}
+
+#define MAX_RS 64
+static struct { struct lws *wsi; WsSession *sess; Room *room; int conn_id; } g_rs[MAX_RS];
+static int g_rs_n = 0;
+static pthread_mutex_t g_rs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void rs_add(struct lws *wsi, WsSession *sess, Room *r) {
+    pthread_mutex_lock(&g_rs_lock);
+    if (g_rs_n < MAX_RS) {
+        g_rs[g_rs_n].wsi = wsi;
+        g_rs[g_rs_n].sess = sess;
+        g_rs[g_rs_n].room = r;
+        g_rs[g_rs_n].conn_id = sess->conn_id;
+        g_rs_n++;
+    }
+    pthread_mutex_unlock(&g_rs_lock);
+}
+
+static void rs_remove(struct lws *wsi) {
+    pthread_mutex_lock(&g_rs_lock);
+    for (int i=0;i<g_rs_n;i++) if (g_rs[i].wsi==wsi) { g_rs[i]=g_rs[--g_rs_n]; break; }
+    pthread_mutex_unlock(&g_rs_lock);
+}
+
+static void broadcast_room(Room *r, const char *fmt, ...) {
+    char raw[4096]; 
+    va_list ap; va_start(ap,fmt); vsnprintf(raw,sizeof(raw),fmt,ap); va_end(ap);
+    
+    pthread_mutex_lock(&g_rs_lock);
+    for (int i=0;i<g_rs_n;i++) {
+        if (g_rs[i].room==r) {
+            append_to_out_buf(g_rs[i].sess, raw);
+            lws_callback_on_writable(g_rs[i].wsi);
+        }
+    }
+    pthread_mutex_unlock(&g_rs_lock);
+}
+
+static void send_to_conn(Room *r, int conn_id, const char *fmt, ...) {
+    char raw[4096]; 
+    va_list ap; va_start(ap,fmt); vsnprintf(raw,sizeof(raw),fmt,ap); va_end(ap);
+    
+    pthread_mutex_lock(&g_rs_lock);
+    for (int i=0;i<g_rs_n;i++) {
+        if (g_rs[i].room==r && g_rs[i].conn_id==conn_id) {
+            append_to_out_buf(g_rs[i].sess, raw);
+            lws_callback_on_writable(g_rs[i].wsi);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_rs_lock);
+}
+
+Board g_presets[100];
+int g_preset_count = 0;
+
+void board_to_json(Board *b, char *out, int maxlen) {
+    char cells[2048]="[", givn[2048]="[", rms[2048]="[";
+    for (int r=0;r<b->size;r++) {
+        strcat(cells,"["); strcat(givn,"["); strcat(rms,"[");
+        for (int c=0;c<b->size;c++) {
+            char t[8]; int last=(c==b->size-1);
+            snprintf(t,8,"%d%s",b->cells[r][c],last?"":","); strcat(cells,t);
+            snprintf(t,8,"%d%s",b->given[r][c], last?"":","); strcat(givn,t);
+            snprintf(t,8,"%d%s",b->rooms[r][c], last?"":","); strcat(rms,t);
+        }
+        int lr=(r==b->size-1);
+        strcat(cells,lr?"]":"],"); strcat(givn,lr?"]":"],"); strcat(rms,lr?"]":"],");
+    }
+    strcat(cells,"]"); strcat(givn,"]"); strcat(rms,"]");
+    snprintf(out,maxlen,"{\"size\":%d,\"cells\":%s,\"given\":%s,\"rooms\":%s}", b->size,cells,givn,rms);
+}
+
+static void load_board(Room *r, int idx) {
+    static int initialized = 0;
+    if (!initialized) {
+        FILE *fp = fopen("admin/assets/puzzle.txt", "r");
+        g_preset_count = 0;
+        if (fp) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp) && g_preset_count < 100) {
+                if (strncmp(line, "SIZE", 4) == 0) {
+                    Board *b = &g_presets[g_preset_count];
+                    memset(b, 0, sizeof(Board));
+                    sscanf(line, "SIZE %d", &b->size);
+                    while(fgets(line, sizeof(line), fp)) {
+                        if (strncmp(line, "TITLE", 5) == 0) {
+                            char *t = line + 5;
+                            while (*t == ' ') t++;
+                            strncpy(b->title, t, 63);
+                            b->title[strcspn(b->title, "\r\n")] = '\0';
+                            break;
+                        }
+                    }
+                    while(fgets(line, sizeof(line), fp)) { if (strncmp(line, "ROOMS", 5) == 0) break; }
+                    int room_map[256] = {0};
+                    int current_room_id = 1;
+                    for (int row = 0; row < b->size; row++) {
+                        if (fgets(line, sizeof(line), fp)) {
+                            char *p = line;
+                            for (int col = 0; col < b->size; col++) {
+                                while (*p == ' ') p++;
+                                if (*p >= 'A' && *p <= 'Z') {
+                                    int letter = (int)*p;
+                                    if (room_map[letter] == 0) { room_map[letter] = current_room_id++; }
+                                    int rid = room_map[letter];
+                                    b->rooms[row][col] = rid;
+                                    b->room_sizes[rid]++;
+                                }
+                                p++;
+                            }
+                        }
+                    }
+                    b->room_count = current_room_id - 1;
+                    while(fgets(line, sizeof(line), fp)) { if (strncmp(line, "GRID", 4) == 0) break; }
+                    for (int row = 0; row < b->size; row++) {
+                        if (fgets(line, sizeof(line), fp)) {
+                            char *p = line;
+                            for (int col = 0; col < b->size; col++) {
+                                while (*p == ' ') p++;
+                                if (*p >= '1' && *p <= '9') {
+                                    b->cells[row][col] = *p - '0';
+                                    b->given[row][col] = 1;
+                                } else if (*p == '.') {
+                                    b->cells[row][col] = 0;
+                                    b->given[row][col] = 0;
+                                }
+                                p++;
+                            }
+                        }
+                    }
+                    g_preset_count++;
+                }
+            }
+            fclose(fp);
+        }
+        initialized = 1;
+    }
+
+    pthread_mutex_lock(&r->lock);
+    if (idx > 0 && idx <= g_preset_count) {
+        r->board = g_presets[idx - 1];
+    } else {
+        if (g_preset_count > 0) {
+            r->board = g_presets[rand() % g_preset_count];
+        } else {
+            r->board = g_presets[0];
+        }
+    }
+    for (int i = 0; i < r->player_count; i++) {
+        r->player_boards[i] = r->board;
+        r->player_board_ready[i] = 1;
+    }
+    pthread_mutex_unlock(&r->lock);
+}
+
+static void broadcast_leaderboard(Room *r) {
+    time_t now = time(NULL);
+    char lead[4096] = "{\"type\":\"leaderboard\",\"players\":[";
+    int first = 1;
+    for (int i = 0; i < r->player_count; i++) {
+        const char *name = r->player_names[i][0] ? r->player_names[i] : "Player";
+        int status = r->player_status[i];
+        long elapsed = 0;
+        if (status == 1) {
+            elapsed = (long)(r->player_finish_time[i] - r->start_time);
+        } else {
+            elapsed = (long)(now - r->start_time);
+        }
+        char entry[256];
+        snprintf(entry, sizeof(entry),
+            "%s{\"name\":\"%s\",\"status\":%d,\"time\":%ld}",
+            first ? "" : ",", name, status, elapsed);
+        strcat(lead, entry);
+        first = 0;
+    }
+    strcat(lead, "]}");
+    broadcast_room(r, lead);
+}
+
+static void *leaderboard_thread(void *arg) {
+    (void)arg;
+    while (g_running) {
+        struct timespec ts;
+        ts.tv_sec = 1;
+        ts.tv_nsec = 0;
+        nanosleep(&ts, NULL);
+        pthread_mutex_lock(&g_rooms_lock);
+        for (int i = 0; i < g_room_count; i++) {
+            Room *r = &g_rooms[i];
+            pthread_mutex_lock(&r->lock);
+            if (r->status == 1) {
+                broadcast_leaderboard(r);
+            }
+            pthread_mutex_unlock(&r->lock);
+        }
+        pthread_mutex_unlock(&g_rooms_lock);
+    }
+    return NULL;
+}
+
+static void handle_msg(struct lws *wsi, WsSession *sess, const char *msg) {
+    char type[32]={0};
+    if (!jstr(msg,"type",type,sizeof(type))) return;
+
+    if (strcmp(type,"register")==0) {
+        char u[64]={0},p[64]={0}; jstr(msg,"username",u,64); jstr(msg,"password",p,64);
+        if (auth_register(u,p)==0) ws_queue(wsi,sess,"{\"type\":\"register_ok\"}");
+        else ws_queue(wsi,sess,"{\"type\":\"register_fail\",\"message\":\"Username taken\"}");
+
+    } else if (strcmp(type,"login")==0) {
+        char u[64]={0},p[64]={0},tok[65]={0}; jstr(msg,"username",u,64); jstr(msg,"password",p,64);
+        if (auth_login(u,p,tok)==0) {
+            User usr; db_get_user(u,&usr);
+            sess->user_id=usr.id; strncpy(sess->username,usr.username,63); strncpy(sess->session_token,tok,64);
+            ws_queue(wsi,sess,"{\"type\":\"login_ok\",\"token\":\"%s\",\"user\":{\"id\":%d,\"username\":\"%s\"}}",tok,usr.id,usr.username);
+        } else { ws_queue(wsi,sess,"{\"type\":\"login_fail\"}"); }
+
+    } else if (strcmp(type,"guest")==0) {
+        static int gn=0; gn++; snprintf(sess->username,63,"Guest%d",gn); sess->user_id=-1;
+        ws_queue(wsi,sess,"{\"type\":\"guest_ok\",\"username\":\"%s\"}",sess->username);
+
+    } else if (strcmp(type,"logout")==0) {
+        auth_logout(sess->session_token); sess->user_id=-1; sess->room=NULL;
+
+    } else if (strcmp(type,"create_room")==0) {
+        int pid = 0; jint(msg, "puzzle_id", &pid);
+        char code[PARTY_CODE_LEN+1]={0};
+        if (game_create_room(sess->user_id,pid,code)==0) {
+            Room *r=game_find_room(code);
+            pthread_mutex_lock(&r->lock);
+            r->player_count = 1;
+            r->status = 0;
+            r->player_status[0] = 0;
+            r->player_finish_time[0] = 0;
+            strncpy(r->player_names[0], sess->username, 63);
+            r->player_names[0][63] = '\0';
+            r->player_board_ready[0] = 0;
+            pthread_mutex_unlock(&r->lock);
+            sess->room=r; sess->is_host=1; load_board(r,pid); rs_add(wsi,sess,r);
+            ws_queue(wsi,sess,"{\"type\":\"room_created\",\"code\":\"%s\",\"is_host\":1,\"players\":1}",code);
+        }
+    } else if (strcmp(type,"join_room")==0) {
+        char code[PARTY_CODE_LEN+1]={0};
+        jstr(msg,"code",code,PARTY_CODE_LEN+1);
+        Room *r=game_find_room(code);
+        if (!r) {
+            ws_queue(wsi,sess,"{\"type\":\"error_msg\",\"message\":\"Room not found\"}");
+            return;
+        }
+        int ret = game_join_room(code, sess->user_id);
+        if (ret != 0) {
+            ws_queue(wsi,sess,"{\"type\":\"error_msg\",\"message\":\"Cannot join room\"}");
+            return;
+        }
+        pthread_mutex_lock(&r->lock);
+        int idx = r->player_count - 1;
+        r->player_status[idx] = 0;
+        r->player_finish_time[idx] = 0;
+        strncpy(r->player_names[idx], sess->username, 63);
+        r->player_names[idx][63] = '\0';
+        r->player_board_ready[idx] = 0;
+        pthread_mutex_unlock(&r->lock);
+        sess->room = r; sess->is_host = 0;
+        rs_add(wsi, sess, r);
+        ws_queue(wsi, sess,
+            "{\"type\":\"room_joined\",\"code\":\"%s\",\"players\":%d,\"status\":%d}",
+            code, r->player_count, r->status);
+        broadcast_room(r,
+            "{\"type\":\"room_update\",\"players\":%d,\"code\":\"%s\"}",
+            r->player_count, code);
+
+    } else if (strcmp(type,"start_party")==0) {
+        if (!sess->room||!sess->is_host) return;
+        Room *r = sess->room;
+        game_start(r);
+        pthread_mutex_lock(&r->lock);
+        for (int i = 0; i < r->player_count; i++) {
+            if (!r->player_board_ready[i]) {
+                r->player_boards[i] = r->board;
+                r->player_board_ready[i] = 1;
+            }
+        }
+        pthread_mutex_unlock(&r->lock);
+
+        pthread_mutex_lock(&g_rs_lock);
+        for (int i = 0; i < g_rs_n; i++) {
+            if (g_rs[i].room == r) {
+                WsSession *s = g_rs[i].sess;
+                int pidx = -1;
+                for (int j = 0; j < r->player_count; j++) {
+                    if (r->player_names[j][0] && strcmp(r->player_names[j], s->username) == 0) {
+                        pidx = j; break;
+                    }
+                }
+                if (pidx < 0) pidx = 0;
+                char bj[4096]; board_to_json(&r->player_boards[pidx], bj, sizeof(bj));
+                
+                snprintf(s->out_buf, sizeof(s->out_buf),
+                         "{\"type\":\"game_start\",\"code\":\"%s\",\"board\":%s}", r->code, bj);
+                s->out_len = strlen(s->out_buf); s->out_ready = 1;
+                lws_callback_on_writable(g_rs[i].wsi);
+            }
+        }
+        pthread_mutex_unlock(&g_rs_lock);
+
+    } else if (strcmp(type,"start_game")==0) {
+        int pid=0; jint(msg,"puzzle_id",&pid);
+        char code[PARTY_CODE_LEN+1]={0};
+        game_create_room(sess->user_id,pid,code);
+        Room *r=game_find_room(code);
+        if (!r) return;
+        pthread_mutex_lock(&r->lock);
+        r->player_count = 1; r->status = 1;
+        r->player_status[0] = 0; r->player_finish_time[0] = 0;
+        strncpy(r->player_names[0], sess->username, 63);
+        r->player_names[0][63] = '\0';
+        pthread_mutex_unlock(&r->lock);
+        sess->room=r; sess->is_host=1; load_board(r,pid); rs_add(wsi,sess,r);
+        game_start(r);
+        char bj[4096]; board_to_json(&r->board, bj, sizeof(bj));
+        
+        ws_queue(wsi,sess,"{\"type\":\"game_start\",\"code\":\"\",\"board\":%s}",bj);
+
+    } else if (strcmp(type,"validate_puzzle")==0 || strcmp(type,"publish_puzzle")==0) {
+        Board b; memset(&b, 0, sizeof(Board));
+        jint(msg, "size", &b.size);
+        jstr(msg, "title", b.title, 64);
+        
+        char cells_flat[1024]={0}, rooms_flat[1024]={0};
+        jstr(msg, "cells_flat", cells_flat, sizeof(cells_flat));
+        jstr(msg, "rooms_flat", rooms_flat, sizeof(rooms_flat));
+
+        int r=0, c=0;
+        char *p = cells_flat;
+        while(*p && r < b.size) {
+            b.cells[r][c] = atoi(p);
+            b.given[r][c] = (b.cells[r][c] > 0) ? 1 : 0;
+            c++; if(c == b.size){ c=0; r++; }
+            while(*p && *p != ',') p++;
+            if(*p == ',') p++;
+        }
+        r=0; c=0; p=rooms_flat;
+        while(*p && r < b.size) {
+            b.rooms[r][c] = atoi(p);
+            b.room_sizes[b.rooms[r][c]]++;
+            c++; if(c == b.size){ c=0; r++; }
+            while(*p && *p != ',') p++;
+            if(*p == ',') p++;
+        }
+
+        if (strcmp(type, "validate_puzzle") == 0) {
+            int initial_valid = 1;
+            for (int rr = 0; rr < b.size; rr++) {
+                for (int cc = 0; cc < b.size; cc++) {
+                    if (b.cells[rr][cc] > 0) {
+                        int temp = b.cells[rr][cc];
+                        b.cells[rr][cc] = 0; 
+                        if (!game_is_valid_move(&b, rr, cc, temp)) {
+                            initial_valid = 0;
+                        }
+                        b.cells[rr][cc] = temp;
+                    }
+                }
+            }
+            
+            if (initial_valid == 0) {
+                ws_queue(wsi, sess, "{\"type\":\"validate_fail\"}");
+                return;
+            }
+
+            Board solved; memset(&solved, 0, sizeof(Board));
+            int ok = solver_run_as_child(&b, &solved);
+            if (ok == 0 && solved.size > 0) {
+                ws_queue(wsi, sess, "{\"type\":\"validate_ok\"}");
+            } else {
+                ws_queue(wsi, sess, "{\"type\":\"validate_fail\"}");
+            }
+        } else {
+            puzzle_save_file("admin/assets/puzzle.txt", &b);
+            if (g_preset_count < 100) {
+                g_presets[g_preset_count] = b;
+                g_preset_count++;
+            }
+            ws_queue(wsi, sess, "{\"type\":\"publish_ok\"}");
+        }
+
+    } else if (strcmp(type,"move")==0) {
+        if (!sess->room || sess->room->status != 1) return;
+        int row=0,col=0,value=0;
+        jint(msg,"row",&row); jint(msg,"col",&col); jint(msg,"value",&value);
+        int pidx = -1;
+        Room *room_ptr = sess->room;
+        pthread_mutex_lock(&room_ptr->lock);
+        for (int i = 0; i < room_ptr->player_count; i++) {
+            if (strcmp(room_ptr->player_names[i], sess->username) == 0) { pidx = i; break; }
+        }
+        if (pidx < 0 || !room_ptr->player_board_ready[pidx]) { pthread_mutex_unlock(&room_ptr->lock); return; }
+        Board *b = &room_ptr->player_boards[pidx];
+        
+        if (row>=0 && row<b->size && col>=0 && col<b->size && !b->given[row][col]) {
+            if (value >= 0 && value <= b->size) {
+                b->cells[row][col] = value;
+                pthread_mutex_unlock(&room_ptr->lock);
+                send_to_conn(room_ptr, sess->conn_id,
+                    "{\"type\":\"move_ok\",\"row\":%d,\"col\":%d,\"value\":%d}",
+                    row, col, value);
+            } else {
+                pthread_mutex_unlock(&room_ptr->lock);
+                send_to_conn(room_ptr, sess->conn_id, "{\"type\":\"invalid_move\"}");
+            }
+        } else {
+            pthread_mutex_unlock(&room_ptr->lock);
+        }
+
+    } else if (strcmp(type,"hint")==0) {
+        if (!sess->room || sess->room->status != 1) return;
+        int pidx = -1;
+        Room *room_ptr = sess->room;
+        pthread_mutex_lock(&room_ptr->lock);
+        for (int i = 0; i < room_ptr->player_count; i++) {
+            if (strcmp(room_ptr->player_names[i], sess->username) == 0) { pidx = i; break; }
+        }
+        if (pidx >= 0 && room_ptr->player_board_ready[pidx]) {
+            Board clean = room_ptr->player_boards[pidx];
+            for(int rr=0; rr<clean.size; rr++) for(int cc=0; cc<clean.size; cc++) if(!clean.given[rr][cc]) clean.cells[rr][cc] = 0;
+            Board solved; memset(&solved, 0, sizeof(Board));
+            
+            if (solver_run_as_child(&clean, &solved) == 0 && solved.size > 0) {
+                int hint_r = -1, hint_c = -1, hint_v = -1;
+                int start_idx = rand() % (clean.size * clean.size);
+                for (int i = 0; i < clean.size * clean.size; i++) {
+                    int idx = (start_idx + i) % (clean.size * clean.size);
+                    int rr = idx / clean.size;
+                    int cc = idx % clean.size;
+                    if (room_ptr->player_boards[pidx].cells[rr][cc] == 0 && !room_ptr->player_boards[pidx].given[rr][cc]) {
+                        hint_r = rr; hint_c = cc; hint_v = solved.cells[rr][cc];
+                        break;
+                    }
+                }
+                
+                if (hint_r != -1) {
+                    room_ptr->player_boards[pidx].cells[hint_r][hint_c] = hint_v;
+                    pthread_mutex_unlock(&room_ptr->lock);
+                    send_to_conn(room_ptr, sess->conn_id, "{\"type\":\"hint_ok\",\"row\":%d,\"col\":%d,\"value\":%d}", hint_r, hint_c, hint_v);
+                    return;
+                } else {
+                    pthread_mutex_unlock(&room_ptr->lock);
+                    send_to_conn(room_ptr, sess->conn_id, "{\"type\":\"error_msg\",\"message\":\"No empty cells! Click Check to see if you have mistakes.\"}");
+                    return;
+                }
+            } else {
+                pthread_mutex_unlock(&room_ptr->lock);
+                send_to_conn(room_ptr, sess->conn_id, "{\"type\":\"error_msg\",\"message\":\"Board calculation error. Cannot generate hint.\"}");
+                return;
+            }
+        }
+        pthread_mutex_unlock(&room_ptr->lock);
+
+    } else if (strcmp(type,"check_board")==0) {
+        if (!sess->room || sess->room->status != 1) return;
+        int pidx = -1;
+        Room *room_ptr = sess->room;
+        pthread_mutex_lock(&room_ptr->lock);
+        for (int i = 0; i < room_ptr->player_count; i++) {
+            if (strcmp(room_ptr->player_names[i], sess->username) == 0) { pidx = i; break; }
+        }
+        if (pidx >= 0 && room_ptr->player_board_ready[pidx]) {
+            Board clean = room_ptr->player_boards[pidx];
+            for(int rr=0; rr<clean.size; rr++) for(int cc=0; cc<clean.size; cc++) if(!clean.given[rr][cc]) clean.cells[rr][cc] = 0;
+            Board solved; memset(&solved, 0, sizeof(Board));
+            if (solver_run_as_child(&clean, &solved) == 0 && solved.size > 0) {
+                char errors[1024] = "["; 
+                int err_count = 0;
+                int empty_count = 0; 
+                
+                for (int rr=0; rr<solved.size; rr++) {
+                    for (int cc=0; cc<solved.size; cc++) {
+                        if (room_ptr->player_boards[pidx].cells[rr][cc] == 0) {
+                            empty_count++;
+                        } else if (room_ptr->player_boards[pidx].cells[rr][cc] != solved.cells[rr][cc]) {
+                            char temp[32]; snprintf(temp, 32, "%s{\"r\":%d,\"c\":%d}", err_count==0?"":",", rr, cc);
+                            strcat(errors, temp); err_count++;
+                        }
+                    }
+                }
+                strcat(errors, "]");
+                pthread_mutex_unlock(&room_ptr->lock);
+                
+                if (err_count == 0 && empty_count == 0) {
+                    long el = (long)(time(NULL) - room_ptr->start_time);
+                    room_ptr->player_status[pidx] = 1;
+                    room_ptr->player_finish_time[pidx] = time(NULL);
+                    send_to_conn(room_ptr, sess->conn_id, "{\"type\":\"board_solved\",\"time\":%ld}", el);
+                    broadcast_leaderboard(room_ptr);
+                    
+                    int all_done = 1;
+                    for(int k=0; k<room_ptr->player_count; k++) {
+                        if (room_ptr->player_status[k] == 0) { all_done = 0; break; }
+                    }
+                    if (all_done) {
+                        room_ptr->status = 2;
+                        broadcast_room(room_ptr, "{\"type\":\"game_over\"}");
+                    }
+                } else if (err_count == 0 && empty_count > 0) {
+                    send_to_conn(room_ptr, sess->conn_id, "{\"type\":\"check_result\",\"errors\":[]}");
+                } else {
+                    send_to_conn(room_ptr, sess->conn_id, "{\"type\":\"check_result\",\"errors\":%s}", errors);
+                }
+            } else {
+                pthread_mutex_unlock(&room_ptr->lock);
+            }
+        }
+  } else if (strcmp(type,"auto_solve")==0) {
+      if (!sess->room) return;
+      Board clean = sess->room->board;
+      for(int r=0; r<clean.size; r++) for(int c=0; c<clean.size; c++) if(!clean.given[r][c]) clean.cells[r][c] = 0;
+      Board solved; memset(&solved, 0, sizeof(Board));
+      int _dbg = solver_run_as_child(&clean, &solved);
+      
+      if (_dbg == 0 && solved.size > 0) {
+        pthread_mutex_lock(&sess->room->lock);
+        int pidx = -1;
+        for (int i = 0; i < sess->room->player_count; i++) {
+            if (strcmp(sess->room->player_names[i], sess->username) == 0) { pidx = i; break; }
+        }
+        if (pidx >= 0) {
+            for (int r=0;r<solved.size;r++) {
+                for (int c=0;c<solved.size;c++) {
+                    if (!sess->room->player_boards[pidx].given[r][c]) 
+                        sess->room->player_boards[pidx].cells[r][c] = solved.cells[r][c];
+                }
+            }
+        }
+        
+        long elapsed = (long)(time(NULL) - sess->room->start_time);
+        sess->room->player_status[pidx] = 1;
+        sess->room->player_finish_time[pidx] = time(NULL);
+        pthread_mutex_unlock(&sess->room->lock);
+
+        char bj[4096]; board_to_json(&sess->room->player_boards[pidx],bj,sizeof(bj));
+        
+        send_to_conn(sess->room, sess->conn_id, "{\"type\":\"board_update\",\"board\":%s}",bj);
+        send_to_conn(sess->room, sess->conn_id, "{\"type\":\"board_solved\",\"time\":%ld}", elapsed);
+        broadcast_leaderboard(sess->room);
+        
+        int all_done = 1;
+        for(int k=0; k<sess->room->player_count; k++) {
+            if (sess->room->player_status[k] == 0) { all_done = 0; break; }
+        }
+        if (all_done) {
+            sess->room->status = 2;
+            broadcast_room(sess->room, "{\"type\":\"game_over\"}");
+        }
+      }
+    } else if (strcmp(type,"leave_room")==0) {
+        if (sess->room) {
+            Room *r = sess->room;
+            pthread_mutex_lock(&r->lock);
+            r->player_count--;
+            if (r->player_count <= 0) r->player_count = 0;
+            pthread_mutex_unlock(&r->lock);
+            sess->room = NULL;
+            ws_queue(wsi, sess, "{\"type\":\"leave_ok\"}");
+        }
+    } else if (strcmp(type,"gallery_list")==0) {
+        if (g_preset_count == 0) {
+            Room dummy; pthread_mutex_init(&dummy.lock, NULL);
+            load_board(&dummy, 1);
+            pthread_mutex_destroy(&dummy.lock);
+        }
+        char pbuf[8192] = "[";
+        for (int i = 0; i < g_preset_count; i++) {
+            char bj[4096]; board_to_json(&g_presets[i], bj, sizeof(bj));
+            char t[4200];
+            snprintf(t, sizeof(t), "{\"id\":%d,\"title\":\"%s\",\"size\":%d,\"board\":%s}%s",
+                     i+1, g_presets[i].title[0] ? g_presets[i].title : "Untitled", g_presets[i].size, bj, (i==g_preset_count-1)?"":",");
+            strcat(pbuf, t);
+        }
+        strcat(pbuf, "]");
+        ws_queue(wsi, sess, "{\"type\":\"gallery_data\",\"puzzles\":%s}", pbuf);
+    }
+}
+
+static int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
+    WsSession *sess = (WsSession *)user;
+    switch (reason) {
+        case LWS_CALLBACK_ESTABLISHED:
+            memset(sess, 0, sizeof(WsSession));
+            sess->user_id = -1;
+            sess->conn_id = ++g_conn_counter;
+            break;
+        case LWS_CALLBACK_RECEIVE: {
+            int rem = (int)(sizeof(sess->pending) - sess->pending_len - 1);
+            int copy = (int)len < rem ? (int)len : rem;
+            memcpy(sess->pending + sess->pending_len, in, copy);
+            sess->pending_len += copy;
+            sess->pending[sess->pending_len] = '\0';
+            if (lws_is_final_fragment(wsi)) {
+                handle_msg(wsi, sess, sess->pending);
+                sess->pending_len = 0;
+                sess->pending[0] = '\0';
+            }
+            break;
+        }
+        case LWS_CALLBACK_SERVER_WRITEABLE:
+            if (sess->out_ready && sess->out_len > 0) {
+                unsigned char *buf = malloc(LWS_PRE + sess->out_len + 1);
+                if (buf) {
+                    memcpy(buf + LWS_PRE, sess->out_buf, sess->out_len);
+                    lws_write(wsi, buf + LWS_PRE, sess->out_len, LWS_WRITE_TEXT);
+                    free(buf);
+                }
+                sess->out_ready = 0;
+                sess->out_len = 0;
+            }
+            break;
+        case LWS_CALLBACK_CLOSED:
+            rs_remove(wsi);
+            if (sess && sess->room) {
+                Room *r = sess->room;
+                pthread_mutex_lock(&r->lock);
+                r->player_count--;
+                if (r->player_count <= 0) r->player_count = 0;
+                pthread_mutex_unlock(&r->lock);
+                sess->room = NULL;
+            }
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+static struct lws_protocols protocols[] = {
+    {
+        .name = "ripple-protocol",
+        .callback = callback_ws,
+        .per_session_data_size = sizeof(WsSession),
+        .rx_buffer_size = 8192
+    },
+    { 0 }
+};
+
+static struct lws_context *g_lws_ctx = NULL;
+static pthread_t g_lws_thread;
+static pthread_t g_ldr_thread;
+
+static void *lws_loop(void *arg) {
+    (void)arg;
+    while (g_running) lws_service(g_lws_ctx, 50);
+    return NULL;
+}
+
+void websocket_start(int port) {
+    srand(time(NULL));
+    struct lws_context_creation_info info;
+    memset(&info, 0, sizeof(info));
+    info.port = port;
+    info.protocols = protocols;
+    info.mounts = NULL;
+    info.options = LWS_SERVER_OPTION_VALIDATE_UTF8 | LWS_SERVER_OPTION_SKIP_SERVER_CANONICAL_NAME;
+    g_lws_ctx = lws_create_context(&info);
+    if (!g_lws_ctx) return;
+    pthread_create(&g_lws_thread, NULL, lws_loop, NULL);
+    pthread_create(&g_ldr_thread, NULL, leaderboard_thread, NULL);
+}
+
+void websocket_stop(void) {
+    if (g_lws_ctx) {
+        pthread_join(g_lws_thread, NULL);
+        pthread_join(g_ldr_thread, NULL);
+        lws_context_destroy(g_lws_ctx);
+        g_lws_ctx = NULL;
+    }
+}
+void websocket_service(void) {}
+
+
+========================================
+FILE: ./admin/src/threads.c
+========================================
+#include "server.h"
+#include "game.h"
+#include "auth.h"
+#include "database.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+/* ── tiny JSON helpers ── */
+static int json_str(const char *json, const char *key, char *out, int maxlen) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return 0;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    if (*p == '"') {
+        p++;
+        int i = 0;
+        while (*p && *p != '"' && i < maxlen - 1) out[i++] = *p++;
+        out[i] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+static int json_int(const char *json, const char *key, int *out) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return 0;
+    p += strlen(search);
+    while (*p == ' ') p++;
+    *out = atoi(p);
+    return 1;
+}
+
+static void send_json(PlayerConn *pc, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    server_send(pc, buf);
+}
+
+/* ── message dispatcher ── */
+static void handle_message(PlayerConn *pc, const char *msg) {
+    char type[32] = {0};
+    if (!json_str(msg, "type", type, sizeof(type))) return;
+
+    /* ── register ── */
+    if (strcmp(type, "register") == 0) {
+        char user[64]={0}, pass[64]={0};
+        json_str(msg, "username", user, 64);
+        json_str(msg, "password", pass, 64);
+        if (auth_register(user, pass) == 0)
+            send_json(pc, "{\"type\":\"register_ok\"}");
+        else
+            send_json(pc, "{\"type\":\"register_fail\",\"message\":\"Username taken\"}");
+
+    /* ── login ── */
+    } else if (strcmp(type, "login") == 0) {
+        char user[64]={0}, pass[64]={0}, token[65]={0};
+        json_str(msg, "username", user, 64);
+        json_str(msg, "password", pass, 64);
+        if (auth_login(user, pass, token) == 0) {
+            User u; db_get_user(user, &u);
+            pc->user_id = u.id;
+            strncpy(pc->session_token, token, 64);
+            send_json(pc,
+                "{\"type\":\"login_ok\",\"token\":\"%s\","
+                "\"user\":{\"id\":%d,\"username\":\"%s\"}}",
+                token, u.id, u.username);
+        } else {
+            send_json(pc, "{\"type\":\"login_fail\"}");
+        }
+
+    /* ── logout ── */
+    } else if (strcmp(type, "logout") == 0) {
+        auth_logout(pc->session_token);
+        pc->user_id = -1;
+
+    /* ── create_room ── */
+    } else if (strcmp(type, "create_room") == 0) {
+        char code[PARTY_CODE_LEN + 1] = {0};
+        if (game_create_room(pc->user_id, 1, code) == 0)
+            send_json(pc, "{\"type\":\"room_created\",\"code\":\"%s\"}", code);
+        else
+            send_json(pc, "{\"type\":\"error_msg\",\"message\":\"Cannot create room\"}");
+
+    /* ── join_room ── */
+    } else if (strcmp(type, "join_room") == 0) {
+        char code[PARTY_CODE_LEN + 1] = {0};
+        json_str(msg, "code", code, PARTY_CODE_LEN + 1);
+        Room *r = game_find_room(code);
+        if (!r) {
+            send_json(pc, "{\"type\":\"error_msg\",\"message\":\"Room not found\"}");
+            return;
+        }
+        game_join_room(code, pc->user_id);
+        pc->room = r;
+        /* send current board state */
+        send_json(pc, "{\"type\":\"room_created\",\"code\":\"%s\"}", code);
+
+    /* ── start_game ── */
+    } else if (strcmp(type, "start_game") == 0) {
+        int puzzle_id = 1;
+        json_int(msg, "puzzle_id", &puzzle_id);
+        char code[PARTY_CODE_LEN + 1] = {0};
+        game_create_room(pc->user_id, puzzle_id, code);
+        Room *r = game_find_room(code);
+        if (!r) { send_json(pc, "{\"type\":\"error_msg\",\"message\":\"Failed\"}"); return; }
+        pc->room = r;
+        game_start(r);
+        /* send board as JSON */
+        Board *b = &r->board;
+        char cells[512]="[", given[512]="[";
+        for (int row=0;row<b->size;row++){
+            strcat(cells,"["); strcat(given,"[");
+            for(int col=0;col<b->size;col++){
+                char tmp[8];
+                snprintf(tmp,sizeof(tmp),"%d%s",b->cells[row][col],col<b->size-1?",":"");
+                strcat(cells,tmp);
+                snprintf(tmp,sizeof(tmp),"%d%s",b->given[row][col],col<b->size-1?",":"");
+                strcat(given,tmp);
+            }
+            strcat(cells,row<b->size-1?"]," : "]");
+            strcat(given,row<b->size-1?"]," : "]");
+        }
+        strcat(cells,"]"); strcat(given,"]");
+        send_json(pc,
+            "{\"type\":\"game_start\",\"board\":"
+            "{\"size\":%d,\"cells\":%s,\"given\":%s}}",
+            b->size, cells, given);
+
+    /* ── move ── */
+    } else if (strcmp(type, "move") == 0) {
+        if (!pc->room) { send_json(pc, "{\"type\":\"error_msg\",\"message\":\"Not in a room\"}"); return; }
+        int row=0, col=0, value=0;
+        json_int(msg, "row",   &row);
+        json_int(msg, "col",   &col);
+        json_int(msg, "value", &value);
+        Board *b = &pc->room->board;
+        sem_t dummy; /* TODO: replace with real per-cell semaphores */
+        sem_init(&dummy, 0, 1);
+        if (game_make_move(b, row, col, value, &pc->room->lock, &dummy)) {
+            send_json(pc,
+                "{\"type\":\"move_ok\",\"row\":%d,\"col\":%d,\"value\":%d}",
+                row, col, value);
+            if (game_is_solved(b)) {
+                send_json(pc,
+                    "{\"type\":\"game_won\",\"winner\":\"%s\",\"time\":0}",
+                    pc->user_id >= 0 ? "You" : "Guest");
+            }
+        } else {
+            send_json(pc, "{\"type\":\"invalid_move\"}");
+        }
+        sem_destroy(&dummy);
+
+    /* ── hint ── */
+    } else if (strcmp(type, "hint") == 0) {
+        send_json(pc, "{\"type\":\"hint_response\",\"row\":0,\"col\":0,\"value\":1}");
+
+    /* ── save_game ── */
+    } else if (strcmp(type, "save_game") == 0) {
+        if (pc->room && pc->user_id >= 0) {
+            long elapsed = (long)(time(NULL) - pc->room->start_time);
+            db_save_game(pc->user_id, &pc->room->board, (int)elapsed);
+        }
+        send_json(pc, "{\"type\":\"save_ok\"}");
+
+    /* ── leave_room ── */
+    } else if (strcmp(type, "leave_room") == 0) {
+        pc->room = NULL;
+
+    /* ── gallery_list ── */
+    } else if (strcmp(type, "gallery_list") == 0) {
+        send_json(pc, "{\"type\":\"gallery_data\",\"puzzles\":[]}");
+    }
+}
+
+void *player_thread(void *arg) {
+    PlayerConn *pc = (PlayerConn *)arg;
+    char buf[2048];
+    ssize_t n;
+    while ((n = recv(pc->socket_fd, buf, sizeof(buf) - 1, 0)) > 0) {
+        buf[n] = '\0';
+        handle_message(pc, buf);
+    }
+    if (pc->room) pc->room = NULL;
+    close(pc->socket_fd);
+    free(pc);
+    return NULL;
+}
+
+
+========================================
+FILE: ./admin/src/game.c
+========================================
+#include "game.h"
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+int game_is_valid_move(Board *b, int row, int col, int val) {
+    if (val < 1 || val > b->size) return 0;
+    int rid = b->rooms[row][col];
+    if (val > b->room_sizes[rid]) return 0;
+    for (int r=0; r<b->size; r++)
+        for (int c=0; c<b->size; c++)
+            if (b->rooms[r][c]==rid && (r!=row||c!=col) && b->cells[r][c]==val) return 0;
+    for (int c=0; c<b->size; c++)
+        if (c!=col && b->cells[row][c]==val && abs(col-c)<=val) return 0;
+    for (int r=0; r<b->size; r++)
+        if (r!=row && b->cells[r][col]==val && abs(row-r)<=val) return 0;
+    return 1;
+}
+
+int game_is_solved(Board *b) {
+    for (int r=0; r<b->size; r++)
+        for (int c=0; c<b->size; c++)
+            if (b->cells[r][c]==0) return 0;
+    for (int r=0; r<b->size; r++)
+        for (int c=0; c<b->size; c++)
+            if (!game_is_valid_move(b,r,c,b->cells[r][c])) return 0;
+    return 1;
+}
+
+int game_make_move(Board *b, int row, int col, int val, pthread_mutex_t *lock, sem_t *cell_sems) {
+    sem_wait(&cell_sems[row * MAX_BOARD_SIZE + col]);
+    pthread_mutex_lock(lock);
+    if (!b->given[row][col] && game_is_valid_move(b, row, col, val)) {
+        b->cells[row][col] = val;
+        pthread_mutex_unlock(lock);
+        sem_post(&cell_sems[row * MAX_BOARD_SIZE + col]);
+        return 1;
+    }
+    pthread_mutex_unlock(lock);
+    sem_post(&cell_sems[row * MAX_BOARD_SIZE + col]);
+    return 0;
+}
+
+void game_reset_board(Board *b) {
+    for (int r=0; r<b->size; r++)
+        for (int c=0; c<b->size; c++)
+            if (!b->given[r][c]) b->cells[r][c] = 0;
+}
+
+static void gen_party_code(char *out) {
+    const char *alpha = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    int fd = open("/dev/urandom", O_RDONLY);
+    unsigned char buf[PARTY_CODE_LEN];
+    read(fd, buf, PARTY_CODE_LEN);
+    close(fd);
+    for (int i=0; i<PARTY_CODE_LEN; i++) out[i] = alpha[buf[i] % 32];
+    out[PARTY_CODE_LEN] = 0;
+}
+
+int game_create_room(int hostid, int puzzleid, char *out_code) {
+    pthread_mutex_lock(&g_rooms_lock);
+    if (g_room_count >= MAX_ROOMS) { pthread_mutex_unlock(&g_rooms_lock); return -1; }
+    Room *r = &g_rooms[g_room_count++];
+    memset(r, 0, sizeof(*r));
+    gen_party_code(r->code);
+    r->host_id = hostid; r->puzzle_id = puzzleid; r->status = 0;
+    pthread_mutex_init(&r->lock, NULL);
+    strncpy(out_code, r->code, PARTY_CODE_LEN+1);
+    pthread_mutex_unlock(&g_rooms_lock);
+    return 0;
+}
+
+Room *game_find_room(const char *code) {
+    for (int i=0; i<g_room_count; i++)
+        if (strncmp(g_rooms[i].code, code, PARTY_CODE_LEN)==0) return &g_rooms[i];
+    return NULL;
+}
+
+int game_join_room(const char *code, int playerid) {
+    Room *r = game_find_room(code);
+    if (!r) return -1;
+    pthread_mutex_lock(&r->lock);
+    if (r->status != 0 || r->player_count >= MAX_PLAYERS) {
+        pthread_mutex_unlock(&r->lock);
+        return -1;
+    }
+    r->player_ids[r->player_count++] = playerid;
+    pthread_mutex_unlock(&r->lock);
+    return 0;
+}
+
+void game_start(Room *r) {
+    pthread_mutex_lock(&r->lock);
+    r->status = 1; r->start_time = time(NULL);
+    pthread_mutex_unlock(&r->lock);
+}
+
+void game_finish(Room *r, int winner_id) {
+    (void)winner_id;
+    pthread_mutex_lock(&r->lock);
+    r->status = 2;
+    pthread_mutex_unlock(&r->lock);
+}
+
+int game_get_room_count(void) { extern int g_room_count; return g_room_count; }
+
+
+========================================
+FILE: ./admin/src/signals.c
+========================================
+#include "ripple.h"
+#include <signal.h>
+#include <stdio.h>
+
+void signals_setup(void) {
+    struct sigaction sa_term = { .sa_handler = SIG_DFL };
+    struct sigaction sa_alrm = { .sa_handler = SIG_DFL };
+    sigemptyset(&sa_term.sa_mask);
+    sigemptyset(&sa_alrm.sa_mask);
+    sigaction(SIGTERM, &sa_term, NULL);
+    sigaction(SIGALRM, &sa_alrm, NULL);
+    /* SIGPIPE ignored to prevent crash on broken WebSocket connections */
+    signal(SIGPIPE, SIG_IGN);
+}
+
+
+========================================
+FILE: ./admin/src/auth.c
+========================================
+#include "auth.h"
+#include "database.h"
+#include <openssl/sha.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+
+int auth_hash_password(const char *password, char *out_hex65) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((unsigned char *)password, strlen(password), hash);
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+        sprintf(out_hex65 + i * 2, "%02x", hash[i]);
+    out_hex65[64] = '\0';
+    return 0;
+}
+
+int auth_generate_token(char *out_hex65) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    unsigned char buf[TOKEN_LEN];
+    read(fd, buf, TOKEN_LEN);
+    close(fd);
+    for (int i = 0; i < TOKEN_LEN; i++)
+        sprintf(out_hex65 + i * 2, "%02x", buf[i]);
+    out_hex65[TOKEN_LEN * 2] = '\0';
+    return 0;
+}
+
+int auth_register(const char *username, const char *password) {
+    char hash[65];
+    auth_hash_password(password, hash);
+    return db_create_user(username, hash);
+}
+
+int auth_login(const char *username, const char *password, char *out_token) {
+    User u;
+    if (db_get_user(username, &u) != 0) return -1;
+    char hash[65];
+    auth_hash_password(password, hash);
+    if (strcmp(hash, u.password_hash) != 0) return -1;
+    auth_generate_token(out_token);
+    long expires = (long)time(NULL) + 86400; /* 24h */
+    db_save_session(out_token, u.id, expires);
+    return 0;
+}
+
+int auth_validate_token(const char *token, int *out_user_id) {
+    Session s;
+    if (db_get_session(token, &s) != 0) return -1;
+    if ((long)time(NULL) > s.expires_at) { db_delete_session(token); return -1; }
+    *out_user_id = s.user_id;
+    return 0;
+}
+
+int auth_logout(const char *token) {
+    return db_delete_session(token);
+}
+
+
+========================================
+FILE: ./admin/src/board.c
+========================================
+#include "ripple.h"
+#include <string.h>
+
+void board_init(Board *b, int size) {
+    memset(b, 0, sizeof(*b));
+    b->size = size;
+}
+
+void board_print(const Board *b) {
+    for (int r = 0; r < b->size; r++) {
+        for (int c = 0; c < b->size; c++)
+            printf("%2d", b->cells[r][c]);
+        printf("\n");
+    }
+}
+
+
+========================================
+FILE: ./admin/src/server.c
+========================================
+#include <sys/socket.h>
+#include "server.h"
+#include "ripple.h"
+#include "auth.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <pthread.h>
+
+static int g_server_fd  = -1;
+static int g_epoll_fd   = -1;
+static pthread_t g_accept_thread;
+
+static void *accept_loop(void *arg) {
+    (void)arg;
+    struct epoll_event events[64];
+    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_server_fd,
+              &(struct epoll_event){.events=EPOLLIN, .data.fd=g_server_fd});
+
+    while (g_running) {
+        int nfds = epoll_wait(g_epoll_fd, events, 64, 1000);
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == g_server_fd) {
+                struct sockaddr_in cli;
+                socklen_t len = sizeof(cli);
+                int cfd = accept(g_server_fd, (struct sockaddr *)&cli, &len);
+                if (cfd < 0) continue;
+                PlayerConn *pc = calloc(1, sizeof(PlayerConn));
+                pc->socket_fd = cfd;
+                pc->user_id   = -1; /* set after auth handshake */
+                pthread_create(&pc->thread, NULL, player_thread, pc);
+                pthread_detach(pc->thread);
+            }
+        }
+    }
+    return NULL;
+}
+
+int server_start(int port) {
+    g_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(port),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+    bind(g_server_fd, (struct sockaddr *)&addr, sizeof(addr));
+    listen(g_server_fd, 16);
+    g_epoll_fd = epoll_create1(0);
+    pthread_create(&g_accept_thread, NULL, accept_loop, NULL);
+    fprintf(stdout, "[Server] Listening on port %d\n", port);
+    return 0;
+}
+
+void server_stop(void) {
+    g_running = 0;
+    pthread_join(g_accept_thread, NULL);
+    close(g_server_fd);
+    close(g_epoll_fd);
+}
+
+void server_broadcast(Room *room, const char *msg) {
+    /* TODO: send msg to all connected sockets in room */
+    (void)room; (void)msg;
+}
+
+void server_send(PlayerConn *pc, const char *msg) {
+    send(pc->socket_fd, msg, strlen(msg), 0);
+}
+
+
+========================================
+FILE: ./admin/puzzle/validator.c
+========================================
+#include "puzzle.h"
+#include "solver.h"
+
+int puzzle_validate(Board *b) {
+    Board copy = *b;
+    return solver_solve(&copy);
+}
+
+
+========================================
+FILE: ./admin/puzzle/loader.c
+========================================
+#include "puzzle.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+/* Maps any printable symbol → integer room ID */
+typedef struct { char sym; int id; } SymMap;
+#define MAX_SYMS 128
+
+static int sym_to_id(SymMap *map, int *count, char sym) {
+    for (int i = 0; i < *count; i++)
+        if (map[i].sym == sym) return map[i].id;
+    int id = ++(*count);
+    map[*count - 1].sym = sym;
+    map[*count - 1].id  = id;
+    return id;
+}
+
+int puzzle_load_file(const char *path, Board *boards, int max_count) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) { perror("puzzle_load_file"); return 0; }
+
+    int   count   = 0;
+    char  line[512];
+    Board *b      = NULL;
+    int   row     = 0;
+    int   section = 0; /* 0=header 1=ROOMS 2=GRID */
+    SymMap sym_map[MAX_SYMS];
+    int    sym_count = 0;
+
+    while (fgets(line, sizeof(line), fp) && count < max_count) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue; /* skip blank lines */
+
+        if (strncmp(line, "SIZE", 4) == 0) {
+            b = &boards[count];
+            memset(b, 0, sizeof(*b));
+            memset(sym_map, 0, sizeof(sym_map));
+            sym_count = 0;
+            b->size = atoi(line + 5);
+            section = 0; row = 0;
+
+        } else if (strncmp(line, "TITLE", 5) == 0) {
+            strncpy(b->title, line + 6, 63);
+
+        } else if (strcmp(line, "ROOMS") == 0) {
+            section = 1; row = 0;
+
+        } else if (strcmp(line, "GRID") == 0) {
+            section = 2; row = 0;
+
+        } else if (strcmp(line, "---") == 0) {
+            if (b) {
+                /* compute room sizes */
+                memset(b->room_sizes, 0, sizeof(b->room_sizes));
+                for (int r = 0; r < b->size; r++)
+                    for (int c = 0; c < b->size; c++) {
+                        int id = b->rooms[r][c];
+                        if (id > 0 && id <= MAX_ROOMS_PER_BOARD) {
+                            b->room_sizes[id]++;
+                            if (id > b->room_count) b->room_count = id;
+                        }
+                    }
+            }
+            count++;
+            b = NULL; section = 0; row = 0;
+
+        } else if (b && row < b->size) {
+            if (section == 1) {
+                /* ROOMS: tokenise by whitespace, each token is a symbol (1 char) */
+                char *tok = strtok(line, " \t");
+                for (int c = 0; tok && c < b->size; c++, tok = strtok(NULL, " \t")) {
+                    b->rooms[row][c] = sym_to_id(sym_map, &sym_count, tok[0]);
+                }
+                row++;
+            } else if (section == 2) {
+                /* GRID: '.' = 0 (empty), digit = given value */
+                char *tok = strtok(line, " \t");
+                for (int c = 0; tok && c < b->size; c++, tok = strtok(NULL, " \t")) {
+                    if (tok[0] == '.') {
+                        b->cells[row][c] = 0;
+                        b->given[row][c] = 0;
+                    } else {
+                        b->cells[row][c] = atoi(tok);
+                        b->given[row][c] = 1;
+                    }
+                }
+                row++;
+            }
+        }
+    }
+    fclose(fp);
+    return count;
+}
+
+int puzzle_save_file(const char *path, Board *b) {
+    /* symbols for saving: A-Z a-z 0-9 @ # $ % ^ & * ! ? ~ */
+    const char sym_table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        "0123456789@#$%^&*!?~";
+    FILE *fp = fopen(path, "a");
+    if (!fp) return -1;
+    fprintf(fp, "SIZE %d\nTITLE %s\nROOMS\n", b->size, b->title);
+    for (int r = 0; r < b->size; r++) {
+        for (int c = 0; c < b->size; c++) {
+            int id = b->rooms[r][c] - 1; /* 1-based → 0-based index */
+            char sym = (id >= 0 && id < (int)sizeof(sym_table) - 1)
+                       ? sym_table[id] : '?';
+            fprintf(fp, "%c%s", sym, c < b->size - 1 ? " " : "");
+        }
+        fprintf(fp, "\n");
+    }
+    fprintf(fp, "GRID\n");
+    for (int r = 0; r < b->size; r++) {
+        for (int c = 0; c < b->size; c++) {
+            if (b->given[r][c])
+                fprintf(fp, "%d%s", b->cells[r][c], c < b->size - 1 ? " " : "");
+            else
+                fprintf(fp, ".%s", c < b->size - 1 ? " " : "");
+        }
+        fprintf(fp, "\n");
+    }
+    fprintf(fp, "---\n");
+    fclose(fp);
+    return 0;
+}
+
+
+========================================
+FILE: ./admin/puzzle/editor.c
+========================================
+#include "puzzle.h"
+#include <ncurses.h>
+#include <string.h>
+
+int puzzle_editor_run(Board *b) {
+    int cur_r = 0, cur_c = 0;
+    while (1) {
+        clear();
+        mvprintw(0, 0, "Puzzle Editor — %dx%d  [arrow=move] [1-%d=value] [s=save] [q=quit]",
+                 b->size, b->size, b->size);
+        for (int r = 0; r < b->size; r++) {
+            for (int c = 0; c < b->size; c++) {
+                if (r == cur_r && c == cur_c) attron(A_REVERSE);
+                mvprintw(r + 2, c * 3, "%2d", b->cells[r][c]);
+                if (r == cur_r && c == cur_c) attroff(A_REVERSE);
+            }
+        }
+        refresh();
+        int ch = getch();
+        switch (ch) {
+            case KEY_UP:    cur_r = (cur_r - 1 + b->size) % b->size; break;
+            case KEY_DOWN:  cur_r = (cur_r + 1)           % b->size; break;
+            case KEY_LEFT:  cur_c = (cur_c - 1 + b->size) % b->size; break;
+            case KEY_RIGHT: cur_c = (cur_c + 1)           % b->size; break;
+            case 's': case 'S':
+                if (puzzle_validate(b)) {
+                    mvprintw(b->size + 3, 0, "Valid! Saving...");
+                    refresh();
+                    return 0;
+                } else {
+                    mvprintw(b->size + 3, 0, "Not solvable — keep editing.");
+                    refresh();
+                }
+                break;
+            case 'q': case 'Q': return -1;
+            default:
+                if (ch >= '1' && ch <= '0' + b->size) {
+                    b->cells[cur_r][cur_c] = ch - '0';
+                    b->given[cur_r][cur_c] = 1;
+                } else if (ch == '0' || ch == KEY_DC) {
+                    b->cells[cur_r][cur_c] = 0;
+                    b->given[cur_r][cur_c] = 0;
+                }
+        }
+    }
+}
+
+
+========================================
+FILE: ./admin/db/schema.c
+========================================
+#include "database.h"
+#include <stdio.h>
+
+static const char *SCHEMA_SQL =
+    "CREATE TABLE IF NOT EXISTS users ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  username TEXT UNIQUE NOT NULL,"
+    "  password_hash TEXT NOT NULL,"
+    "  total_wins INTEGER DEFAULT 0,"
+    "  total_games INTEGER DEFAULT 0"
+    ");"
+    "CREATE TABLE IF NOT EXISTS sessions ("
+    "  token TEXT PRIMARY KEY,"
+    "  userid INTEGER NOT NULL,"
+    "  expires_at INTEGER NOT NULL,"
+    "  FOREIGN KEY(userid) REFERENCES users(id)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS puzzles ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  title TEXT NOT NULL,"
+    "  author_id INTEGER,"
+    "  size INTEGER NOT NULL,"
+    "  rooms_json TEXT NOT NULL,"
+    "  play_count INTEGER DEFAULT 0,"
+    "  avg_rating REAL DEFAULT 0,"
+    "  is_verified INTEGER DEFAULT 0,"
+    "  FOREIGN KEY(author_id) REFERENCES users(id)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS ratings ("
+    "  puzzle_id INTEGER NOT NULL,"
+    "  player_id INTEGER NOT NULL,"
+    "  stars INTEGER NOT NULL,"
+    "  PRIMARY KEY(puzzle_id, player_id),"
+    "  FOREIGN KEY(puzzle_id) REFERENCES puzzles(id),"
+    "  FOREIGN KEY(player_id) REFERENCES users(id)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS leaderboard ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  player_id INTEGER NOT NULL,"
+    "  puzzle_id INTEGER NOT NULL,"
+    "  solve_time INTEGER NOT NULL,"
+    "  timestamp INTEGER NOT NULL,"
+    "  FOREIGN KEY(player_id) REFERENCES users(id),"
+    "  FOREIGN KEY(puzzle_id) REFERENCES puzzles(id)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS rooms ("
+    "  code TEXT PRIMARY KEY,"
+    "  host_id INTEGER,"
+    "  puzzle_id INTEGER,"
+    "  status INTEGER DEFAULT 0"
+    ");"
+    "CREATE TABLE IF NOT EXISTS saved_games ("
+    "  player_id INTEGER PRIMARY KEY,"
+    "  board_state TEXT NOT NULL,"
+    "  elapsed_sec INTEGER DEFAULT 0,"
+    "  FOREIGN KEY(player_id) REFERENCES users(id)"
+    ");";
+
+int db_init_schema(void) {
+    char *err = NULL;
+    if (sqlite3_exec(g_db, SCHEMA_SQL, NULL, NULL, &err) != SQLITE_OK) {
+        fprintf(stderr, "DB Schema error: %s\n", err);
+        sqlite3_free(err);
+        return -1;
+    }
+    return 0;
+}
+
+
+========================================
+FILE: ./admin/db/database.c
+========================================
+#include "database.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+sqlite3 *g_db = NULL;
+
+int db_open(const char *path) {
+    if (sqlite3_open(path, &g_db) != SQLITE_OK) {
+        fprintf(stderr, "DB Cannot open: %s\n", sqlite3_errmsg(g_db));
+        return -1;
+    }
+    sqlite3_exec(g_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    return 0;
+}
+
+void db_close(void) {
+    if (g_db) {
+        sqlite3_close(g_db);
+        g_db = NULL;
+    }
+}
+
+int db_create_user(const char *username, const char *pwhash) {
+    const char *sql = "INSERT INTO users(username, password_hash) VALUES(?,?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, pwhash, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int db_get_user(const char *username, User *out) {
+    const char *sql = "SELECT id,username,password_hash,total_wins,total_games FROM users WHERE username=?";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+
+    out->id = sqlite3_column_int(stmt, 0);
+    strncpy(out->username, (char*)sqlite3_column_text(stmt, 1), 63);
+    out->username[63] = '\0';
+    strncpy(out->password_hash, (char*)sqlite3_column_text(stmt, 2), 64);
+    out->password_hash[64] = '\0';
+    out->total_wins = sqlite3_column_int(stmt, 3);
+    out->total_games = sqlite3_column_int(stmt, 4);
+
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+int db_update_stats(int userid, int size, int solvetime, int won) {
+    (void)size; (void)solvetime;
+    const char *sql = "UPDATE users SET total_wins=total_wins+?, total_games=total_games+1 WHERE id=?";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(stmt, 1, won ? 1 : 0);
+    sqlite3_bind_int(stmt, 2, userid);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+int db_save_session(const char *token, int userid, long expiresat) {
+    const char *sql = "INSERT OR REPLACE INTO sessions(token,userid,expires_at) VALUES(?,?,?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, token, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, userid);
+    sqlite3_bind_int64(stmt, 3, expiresat);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+int db_get_session(const char *token, Session *out) {
+    const char *sql = "SELECT token,userid,expires_at FROM sessions WHERE token=?";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, token, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+
+    strncpy(out->token, (char*)sqlite3_column_text(stmt, 0), TOKEN_LEN * 2);
+    out->token[TOKEN_LEN * 2] = '\0';
+    out->user_id = sqlite3_column_int(stmt, 1);
+    out->expires_at = (long)sqlite3_column_int64(stmt, 2);
+
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+int db_delete_session(const char *token) {
+    const char *sql = "DELETE FROM sessions WHERE token=?";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, token, -1, SQLITE_STATIC);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+int db_save_puzzle(Board *b, int authorid, int isverified) { (void)b; (void)authorid; (void)isverified; return 0; }
+int db_get_puzzle(int puzzleid, Board *out) { (void)puzzleid; (void)out; return 0; }
+int db_list_gallery(int offset, int limit, Board *out, int *count) { (void)offset; (void)limit; (void)out; (void)count; return 0; }
+int db_rate_puzzle(int puzzleid, int playerid, int stars) { (void)puzzleid; (void)playerid; (void)stars; return 0; }
+int db_verify_puzzle(int puzzleid) { (void)puzzleid; return 0; }
+int db_delete_puzzle(int puzzleid) { (void)puzzleid; return 0; }
+int db_save_game(int playerid, Board *b, int elapsedsec) { (void)playerid; (void)b; (void)elapsedsec; return 0; }
+int db_load_game(int playerid, Board *out, int *elapsedsec) { (void)playerid; (void)out; (void)elapsedsec; return 0; }
+int db_get_leaderboard(int puzzleid, int limit, int *playerids, int *times) { (void)puzzleid; (void)limit; (void)playerids; (void)times; return 0; }
+
+
+========================================
+FILE: ./user/web/Makefile
+========================================
+CC      = gcc
+CFLAGS  = -Wall -Wextra -g -pthread \
+          -I admin/include \
+          -I /usr/include \
+          -I /usr/local/include
+
+LDFLAGS = -lncurses \
+          -lwebsockets \
+          -L/usr/lib \
+          -L/usr/lib/x86_64-linux-gnu \
+          -L/usr/local/lib \
+          -lsqlite3 \
+          -lcrypto \
+          -lm
+
+SRCS = admin/src/main.c \
+       admin/src/game.c \
+       admin/src/board.c \
+       admin/src/server.c \
+       admin/src/websocket.c \
+       admin/src/auth.c \
+       admin/src/session.c \
+       admin/src/signals.c \
+       admin/src/threads.c \
+       admin/src/epoll_io.c \
+       admin/tui/tui.c \
+       admin/tui/tui_rooms.c \
+       admin/tui/tui_gallery.c \
+       admin/db/database.c \
+       admin/db/schema.c \
+       admin/solver/solver.c \
+       admin/solver/generator.c \
+       admin/puzzle/loader.c \
+       admin/puzzle/editor.c \
+       admin/puzzle/validator.c
+
+TARGET = ripple_server
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET) *.log *.db
+
+.PHONY: all clean
+
+
+========================================
+FILE: ./user/web/index.html
+========================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ripple Effect</title>
+  <style>
+    /* =========================================
+       GLOBAL UI OVERHAUL
+       ========================================= */
+    :root {
+      --primary: #0066ff;
+      --primary-hover: #0052cc;
+      --bg-gradient: linear-gradient(135deg, #f0f4f8 0%, #e2e8f0 100%);
+      --card-bg: #ffffff;
+      --text-main: #1e293b;
+      --text-muted: #64748b;
+      --success: #10b981;
+      --danger: #ef4444;
+    }
+
+    body {
+      margin: 0; padding: 0; font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg-gradient); color: var(--text-main);
+      min-height: 100vh; display: flex; flex-direction: column;
+    }
+
+    header {
+      background: var(--card-bg); padding: 15px 30px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex;
+      justify-content: space-between; align-items: center;
+      position: sticky; top: 0; z-index: 100;
+    }
+
+    header h1 { margin: 0; font-size: 24px; color: var(--primary); }
+    #user-status { font-weight: 500; color: var(--text-muted); }
+
+    main {
+      flex: 1; display: flex; justify-content: center;
+      align-items: flex-start; padding: 40px 20px;
+    }
+
+    .card {
+      background: var(--card-bg); border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+      padding: 40px; width: 100%; max-width: 400px; text-align: center; transition: transform 0.3s ease;
+    }
+
+    .card h2 { margin-top: 0; color: var(--text-main); }
+    
+    input[type="text"], input[type="password"], select {
+      width: 100%; padding: 12px 16px; margin-bottom: 15px; border: 2px solid #e2e8f0;
+      border-radius: 8px; box-sizing: border-box; font-size: 16px; transition: all 0.2s;
+      font-family: inherit; color: var(--text-main);
+    }
+    
+    select {
+      cursor: pointer; appearance: none; -webkit-appearance: none; -moz-appearance: none;
+      background: #fff url("data:image/svg+xml;utf8,<svg fill='%2364748b' height='24' viewBox='0 0 24 24' width='24' xmlns='http://www.w3.org/2000/svg'><path d='M7 10l5 5 5-5z'/><path d='M0 0h24v24H0z' fill='none'/></svg>") no-repeat right 12px center;
+    }
+
+    input:focus, select:focus { 
+      border-color: var(--primary); outline: none; 
+      box-shadow: 0 0 0 3px rgba(0, 102, 255, 0.1); 
+    }
+
+    button {
+      background: var(--primary); color: white; border: none; border-radius: 8px;
+      padding: 12px 20px; font-size: 16px; font-weight: 600; cursor: pointer;
+      width: 100%; margin-bottom: 10px; transition: all 0.2s ease; box-shadow: 0 4px 6px rgba(0, 102, 255, 0.2);
+    }
+
+    button:hover { background: var(--primary-hover); transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0, 102, 255, 0.3); }
+    button:disabled { background: #cbd5e1; cursor: not-allowed; transform: none; box-shadow: none; }
+    button.secondary { background: #f1f5f9; color: #475569; box-shadow: none; }
+    button.secondary:hover { background: #e2e8f0; color: #1e293b; }
+    button.accent { background: #8b5cf6; box-shadow: 0 4px 6px rgba(139, 92, 246, 0.2); }
+    button.accent:hover { background: #7c3aed; }
+
+    hr { border: 0; height: 1px; background: #e2e8f0; margin: 25px 0; }
+
+    .party-code-display {
+      font-size: 36px; font-weight: 900; letter-spacing: 4px; color: var(--primary);
+      background: #f8fafc; padding: 15px; border-radius: 12px; margin: 20px 0; border: 2px dashed #cbd5e1;
+    }
+
+    /* =========================================
+       GAME & LEADERBOARD LAYOUT
+       ========================================= */
+    #game-section, #gallery-section, #results-section, #editor-setup-section, #editor-workspace-section { width: 100%; max-width: 1000px; }
+
+    .topbar {
+      display: flex; justify-content: space-between; align-items: center;
+      background: var(--card-bg); padding: 15px 25px; border-radius: 12px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 25px;
+    }
+
+    .topbar .back-btn { width: auto; margin: 0; padding: 8px 16px; box-shadow: none; }
+    #timer { font-size: 24px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--primary); }
+
+    .game-layout { display: flex; flex-wrap: wrap; gap: 30px; justify-content: center; align-items: flex-start; }
+
+    .leaderboard-area {
+      background: var(--card-bg); border-radius: 16px; padding: 25px; min-width: 280px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.08); position: sticky; top: 100px;
+    }
+
+    .leaderboard-area h3 { margin-top: 0; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; color: var(--text-main); text-align: center;}
+    
+    #leaderboard { list-style: none; padding: 0; margin: 0; }
+    #leaderboard li {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 0; border-bottom: 1px solid #f1f5f9; font-size: 16px; font-weight: 500;
+    }
+    #leaderboard li .time { color: var(--text-muted); font-size: 14px; font-weight: bold; }
+    #leaderboard li .finished-time { color: var(--success); }
+
+    #controls { display: flex; gap: 10px; margin-top: 20px; width: 100%;}
+    #controls button { margin: 0; flex: 1; }
+
+    /* =========================================
+       BOARD RENDERING
+       ========================================= */
+    .board-container {
+      display: grid; margin: 0 auto; width: max-content;
+      background: #fff; border: 4px solid #1e293b; border-radius: 8px; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+    }
+    
+    .cell {
+      width: 55px; height: 55px; display: flex; align-items: center; justify-content: center;
+      font-size: 26px; box-sizing: border-box; border: 1px solid #cbd5e1; 
+      text-align: center; font-family: inherit; padding: 0; margin: 0; outline: none; 
+      transition: background-color 0.3s ease, transform 0.1s ease, color 0.3s ease; cursor: pointer;
+    }
+    
+    div.cell.given { font-weight: 900; color: #0f172a; cursor: default; }
+    input.cell { color: var(--primary); font-weight: 700; background-color: transparent; cursor: text; }
+    
+    input.cell:disabled, input.cell[readonly] {
+      color: var(--primary) !important;
+      opacity: 1 !important;
+      -webkit-text-fill-color: var(--primary) !important; 
+      cursor: default;
+    }
+
+    input.cell:focus {
+      background-color: rgba(255, 255, 255, 0.9) !important; transform: scale(1.1);
+      z-index: 10; border-radius: 6px; box-shadow: 0 0 15px rgba(0,102,255,0.4);
+    }
+    
+    .cell.error { background-color: #fecaca !important; color: var(--danger) !important; font-weight: 900; }
+
+    /* =========================================
+       RESULTS / PODIUM SCREEN
+       ========================================= */
+    .podium-list { list-style: none; padding: 0; margin: 30px 0; text-align: left; }
+    .podium-list li {
+      display: flex; justify-content: flex-start; align-items: center;
+      padding: 20px; margin-bottom: 15px; background: var(--card-bg); border-radius: 12px;
+      font-size: 18px; font-weight: 600; box-shadow: 0 4px 10px rgba(0,0,0,0.05); border-left: 6px solid #cbd5e1;
+    }
+    .podium-list li:nth-child(1) { border-left-color: #fbbf24; background: #fffbeb; font-size: 24px; transform: scale(1.05); margin-bottom: 25px; box-shadow: 0 8px 20px rgba(251, 191, 36, 0.2); }
+    .podium-list li:nth-child(2) { border-left-color: #94a3b8; background: #f8fafc; font-size: 20px; }
+    .podium-list li:nth-child(3) { border-left-color: #b45309; background: #fff7ed; font-size: 18px; }
+
+    .gallery-card { background: var(--card-bg); padding: 20px; border-radius: 12px; margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }
+    .gallery-card button { width: auto; margin: 0; }
+
+    /* =========================================
+       EDITOR SPECIFIC STYLES
+       ========================================= */
+    .editor-palette { display: flex; flex-wrap: wrap; gap: 8px; margin: 15px 0; justify-content: center; }
+    .palette-color { width: 35px; height: 35px; border-radius: 50%; border: 2px solid #ccc; cursor: pointer; transition: transform 0.1s; }
+    .palette-color.active { border: 3px solid #1e293b; transform: scale(1.2); }
+    .editor-tool-toggle { display: flex; gap: 10px; margin-bottom: 15px; }
+    .editor-tool-toggle button { margin: 0; background: #f1f5f9; color: #475569; }
+    .editor-tool-toggle button.active { background: var(--primary); color: #fff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🌊 Ripple Effect</h1>
+    <div id="user-status">🔴 Connecting...</div>
+  </header>
+  
+  <main>
+    <!-- AUTH -->
+    <section id="auth-section">
+      <div class="card">
+        <h2>Welcome Back</h2>
+        <input type="text" id="username" placeholder="Username">
+        <input type="password" id="password" placeholder="Password">
+        <button onclick="login()">Login</button>
+        <button class="secondary" onclick="register()">Create Account</button>
+        <hr>
+        <button class="secondary" onclick="guestMode()" style="background: #e0e7ff; color: #3730a3;">Play as Guest</button>
+      </div>
+    </section>
+
+    <!-- LOBBY -->
+    <section id="lobby-section" style="display:none">
+      <div class="card">
+        <h2>Game Lobby</h2>
+        <button onclick="createRoom()">➕ Create Party Room</button>
+        <div style="display: flex; gap: 10px; margin-top: 10px;">
+          <input type="text" id="party-code" placeholder="Party Code" maxlength="6" style="text-transform:uppercase; margin:0;">
+          <button onclick="joinRoom()" style="margin:0; width:auto;">Join</button>
+        </div>
+        <hr>
+        <button onclick="showSolo()" style="background: #10b981;">🧩 Play Solo</button>
+        <button class="accent" onclick="openEditorSetup()">🛠️ Studio (Create Puzzle)</button>
+        <button class="secondary" onclick="showGallery()">📖 Browse Gallery</button>
+        <button class="secondary" onclick="logout()" style="margin-top: 15px;">Logout</button>
+      </div>
+    </section>
+
+    <!-- WAITING ROOM -->
+    <section id="waiting-section" style="display:none">
+      <div class="card" style="max-width:460px">
+        <h2>⏳ Waiting Room</h2>
+        <p>Invite friends using this code:</p>
+        <div class="party-code-display" id="waiting-code">------</div>
+        <p>Players joined: <strong id="waiting-count">1</strong></p>
+        <button id="start-party-btn" onclick="startParty()" style="display:none; background: #10b981;">▶ Start Game</button>
+        <p style="color:var(--text-muted); font-weight:500;" id="waiting-hint">Waiting for host to start the game...</p>
+        <button class="secondary" onclick="leaveRoom()">← Leave Room</button>
+      </div>
+    </section>
+
+    <!-- GAME -->
+    <section id="game-section" style="display:none">
+      <div class="topbar">
+        <button class="secondary back-btn" onclick="leaveRoom()">← Leave</button>
+        <div id="room-info" style="font-weight: 600; font-size: 18px;"></div>
+        <div id="timer">00:00</div>
+      </div>
+      
+      <div class="game-layout">
+        <div class="board-area">
+          <div id="board-container" class="board-container"></div>
+          <div id="controls">
+            <button class="secondary" onclick="getHint()" id="hint-btn">💡 Hint (5)</button>
+            <button class="secondary" onclick="solveAuto()">🤖 Auto-Solve</button>
+            <button onclick="checkBoard()">✅ Check Board</button>
+          </div>
+        </div>
+        <div class="leaderboard-area">
+          <h3>Live Standings</h3>
+          <ul id="leaderboard"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- RESULTS -->
+    <section id="results-section" style="display:none">
+      <div class="card" style="max-width: 600px;">
+        <h2 style="font-size: 32px; margin-bottom: 5px;">🎉 Match Complete!</h2>
+        <p style="color: var(--text-muted); margin-top:0;">Here are the final standings</p>
+        <ul id="final-ranking" class="podium-list"></ul>
+        <button onclick="backToLobby()" style="padding: 16px; font-size: 18px;">Return to Lobby</button>
+      </div>
+    </section>
+
+    <!-- GALLERY -->
+    <section id="gallery-section" style="display:none">
+      <div class="topbar">
+        <button class="secondary back-btn" onclick="backToLobby()">← Back</button>
+        <h2 style="margin:0;">Public Gallery</h2>
+        <div style="width: 80px;"></div> 
+      </div>
+      <div id="gallery-grid"></div>
+    </section>
+
+    <!-- EDITOR: SETUP -->
+    <section id="editor-setup-section" style="display:none">
+      <div class="card">
+        <h2>🛠️ Studio Setup</h2>
+        <input type="text" id="edit-title" placeholder="Name your puzzle (e.g., 'Tricky Fives')">
+        <select id="edit-size">
+          <option value="3">3 x 3 Grid</option>
+          <option value="4">4 x 4 Grid</option>
+          <option value="5" selected>5 x 5 Grid</option>
+          <option value="6">6 x 6 Grid</option>
+          <option value="7">7 x 7 Grid</option>
+          <option value="8">8 x 8 Grid</option>
+          <option value="9">9 x 9 Grid</option>
+        </select>
+        <button class="accent" onclick="startEditor()">Create Canvas</button>
+        <button class="secondary" onclick="backToLobby()">Cancel</button>
+      </div>
+    </section>
+
+    <!-- EDITOR: WORKSPACE -->
+    <section id="editor-workspace-section" style="display:none">
+      <div class="topbar">
+        <button class="secondary back-btn" onclick="backToLobby()">← Discard</button>
+        <div style="font-weight: 600; font-size: 18px;">Studio: <span id="editor-title-display"></span></div>
+        <div style="width: 80px;"></div>
+      </div>
+      
+      <div class="game-layout">
+        <div class="board-area">
+          <div id="editor-board" class="board-container"></div>
+        </div>
+        
+        <div class="leaderboard-area" style="text-align: center;">
+          <h3>Editing Tools</h3>
+          
+          <div class="editor-tool-toggle">
+            <button id="tool-paint" class="active" onclick="setEditorTool('paint')">🎨 Paint Rooms</button>
+            <button id="tool-number" onclick="setEditorTool('number')">1️⃣ Set Hints</button>
+          </div>
+          
+          <div id="palette-container">
+            <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 5px;">Select a room color, then click cells on the board to group them together.</p>
+            <div id="editor-palette" class="editor-palette"></div>
+          </div>
+          
+          <div id="number-container" style="display:none;">
+            <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 5px;">Click cells to type in starting numbers (or type 0 to clear). Leave cells empty for players to solve.</p>
+          </div>
+
+          <hr>
+          <button style="background: var(--success);" onclick="validatePuzzle()">✅ Validate & Publish</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    let ws = null;
+    let currentToken = localStorage.getItem('token') || null;
+    let currentUser = null;
+    let currentRoom = null;
+    let isHost = false;
+    let gameActive = false;
+    let currentBoard = null;
+    let elapsedSec = 0;
+    let timerInterval = null;
+    let hintsLeft = 5;
+    window.lastLeaderboard = []; 
+
+    // EDITOR STATE
+    let edBoard = null;
+    let edTool = 'paint'; 
+    let edActiveRoom = 1;
+
+    function connect() {
+        let protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(protocol + '//' + window.location.hostname + ':8081', 'ripple-protocol');
+        ws.onopen = () => document.getElementById('user-status').textContent = '🟢 Connected. Please Login.';
+        
+        // NEW FIX: Safely parse newlines so batched payloads are processed reliably!
+        ws.onmessage = (e) => {
+            let msgs = e.data.split('\n');
+            msgs.forEach(m => {
+                if (m.trim()) {
+                    try {
+                        handleMessage(JSON.parse(m));
+                    } catch(err) {
+                        console.error("JSON Error:", err, m);
+                    }
+                }
+            });
+        };
+        
+        ws.onclose = () => document.getElementById('user-status').textContent = '🔴 Connection Lost';
+    }
+
+    function wsSend(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+    
+    function showSection(id) { 
+        ['auth-section', 'lobby-section', 'waiting-section', 'game-section', 'results-section', 'gallery-section', 'editor-setup-section', 'editor-workspace-section'].forEach(sec => {
+            document.getElementById(sec).style.display = (sec === id) ? 'block' : 'none';
+        });
+    }
+
+    window.onload = connect;
+
+    function login() { wsSend({type: 'login', username: document.getElementById('username').value.trim(), password: document.getElementById('password').value}); }
+    function register() { wsSend({type: 'register', username: document.getElementById('username').value.trim(), password: document.getElementById('password').value}); }
+    function guestMode() { wsSend({type: 'guest'}); }
+    function logout() { if (currentToken) wsSend({type: 'logout', token: currentToken}); currentToken = null; currentUser = null; localStorage.removeItem('token'); showSection('auth-section'); }
+    
+    function createRoom() { wsSend({type: 'create_room', puzzle_id: 0}); }
+    function showSolo() { wsSend({type: 'start_game', puzzle_id: 0}); }
+    function showGallery() { showSection('gallery-section'); wsSend({type: 'gallery_list'}); }
+    function joinRoom() { wsSend({type: 'join_room', code: document.getElementById('party-code').value.trim().toUpperCase()}); }
+    function startParty() { if (isHost) wsSend({type: 'start_party'}); }
+    
+    function leaveRoom() { 
+        if (gameActive && !confirm('Leave the room?')) return; 
+        gameActive = false; clearInterval(timerInterval); wsSend({type: 'leave_room'}); showSection('lobby-section'); 
+    }
+    function backToLobby() { showSection('lobby-section'); }
+
+    // --- EDITOR LOGIC ---
+    function openEditorSetup() { document.getElementById('edit-title').value = ''; showSection('editor-setup-section'); }
+
+    function startEditor() {
+        let title = document.getElementById('edit-title').value.trim() || 'Untitled Puzzle';
+        let size = parseInt(document.getElementById('edit-size').value);
+        document.getElementById('editor-title-display').textContent = title;
+        
+        edBoard = { title: title, size: size, cells: [], rooms: [], given: [] };
+        for(let r=0; r<size; r++) {
+            edBoard.cells[r] = []; edBoard.rooms[r] = []; edBoard.given[r] = [];
+            for(let c=0; c<size; c++) {
+                edBoard.cells[r][c] = 0; edBoard.given[r][c] = 0; edBoard.rooms[r][c] = 1; 
+            }
+        }
+        
+        let maxRooms = Math.floor((size * size) / 2) + 2; 
+        let pal = document.getElementById('editor-palette'); pal.innerHTML = '';
+        for(let i=1; i<=maxRooms; i++) {
+            let col = document.createElement('div');
+            col.className = 'palette-color' + (i===1 ? ' active' : '');
+            let hue = (i * 137.508) % 360;
+            col.style.backgroundColor = `hsl(${hue}, 60%, 85%)`;
+            col.onclick = () => { document.querySelectorAll('.palette-color').forEach(el => el.classList.remove('active')); col.classList.add('active'); edActiveRoom = i; };
+            pal.appendChild(col);
+        }
+        
+        setEditorTool('paint'); renderEditor(); showSection('editor-workspace-section');
+    }
+
+    function setEditorTool(tool) {
+        edTool = tool;
+        document.getElementById('tool-paint').classList.toggle('active', tool === 'paint');
+        document.getElementById('tool-number').classList.toggle('active', tool === 'number');
+        document.getElementById('palette-container').style.display = tool === 'paint' ? 'block' : 'none';
+        document.getElementById('number-container').style.display = tool === 'number' ? 'block' : 'none';
+    }
+
+    function renderEditor() {
+        let container = document.getElementById('editor-board');
+        container.innerHTML = ''; container.style.gridTemplateColumns = `repeat(${edBoard.size}, 55px)`;
+        
+        for (let r = 0; r < edBoard.size; r++) {
+            for (let c = 0; c < edBoard.size; c++) {
+                let cell = document.createElement('div'); cell.className = 'cell';
+                if (edBoard.cells[r][c] > 0) { cell.textContent = edBoard.cells[r][c]; cell.classList.add('given'); }
+                
+                let hue = (edBoard.rooms[r][c] * 137.508) % 360;
+                cell.style.backgroundColor = `hsl(${hue}, 60%, 90%)`;
+
+                if (c < edBoard.size - 1 && edBoard.rooms[r][c] !== edBoard.rooms[r][c+1]) cell.style.borderRight = '4px solid #1e293b';
+                if (r < edBoard.size - 1 && edBoard.rooms[r][c] !== edBoard.rooms[r+1][c]) cell.style.borderBottom = '4px solid #1e293b';
+
+                cell.onmousedown = (e) => {
+                    if (edTool === 'paint') { edBoard.rooms[r][c] = edActiveRoom; renderEditor(); } 
+                    else if (edTool === 'number') {
+                        let input = prompt(`Enter starting number (1-${edBoard.size}), or 0 to clear:`, edBoard.cells[r][c]);
+                        if (input !== null) {
+                            let num = parseInt(input.trim());
+                            if (!isNaN(num) && num >= 0 && num <= edBoard.size) { edBoard.cells[r][c] = num; renderEditor(); }
+                        }
+                    }
+                };
+                
+                cell.onmouseenter = (e) => { if (e.buttons === 1 && edTool === 'paint') { edBoard.rooms[r][c] = edActiveRoom; renderEditor(); } };
+                container.appendChild(cell);
+            }
+        }
+    }
+
+    function validatePuzzle() {
+        let cFlat = [], rFlat = [];
+        for(let r=0; r<edBoard.size; r++) {
+            for(let c=0; c<edBoard.size; c++) {
+                cFlat.push(edBoard.cells[r][c]); rFlat.push(edBoard.rooms[r][c]);
+            }
+        }
+        wsSend({ type: 'validate_puzzle', size: edBoard.size, title: edBoard.title, cells_flat: cFlat.join(','), rooms_flat: rFlat.join(',') });
+    }
+
+    // --- GAME LOGIC ---
+    function startTimer(initial) {
+        elapsedSec = initial || 0; clearInterval(timerInterval);
+        timerInterval = setInterval(() => {
+            elapsedSec++; document.getElementById('timer').textContent = String(Math.floor(elapsedSec / 60)).padStart(2, '0') + ':' + String(elapsedSec % 60).padStart(2, '0');
+        }, 1000);
+    }
+
+    function getHint() { if (!gameActive) return; if (hintsLeft <= 0) return alert('No hints left!'); wsSend({type: 'hint'}); }
+    function solveAuto() { wsSend({type: 'auto_solve'}); }
+    function checkBoard() { wsSend({type: 'check_board'}); }
+
+    function renderBoard(board) {
+        let container = document.getElementById('board-container');
+        if (container.children.length !== board.size * board.size) {
+            container.innerHTML = '';
+            container.style.gridTemplateColumns = `repeat(${board.size}, 55px)`;
+            for (let r = 0; r < board.size; r++) {
+                for (let c = 0; c < board.size; c++) {
+                    let isGiven = board.given[r][c];
+                    let cell = isGiven ? document.createElement('div') : document.createElement('input');
+                    cell.className = 'cell'; cell.id = `cell-${r}-${c}`; cell.dataset.r = r; cell.dataset.c = c;
+                    
+                    if (isGiven) cell.classList.add('given');
+                    else { cell.type = 'text'; cell.inputMode = 'numeric'; cell.maxLength = 1; }
+
+                    let hue = (board.rooms[r][c] * 137.508) % 360;
+                    cell.style.backgroundColor = `hsl(${hue}, 60%, 90%)`;
+
+                    if (c < board.size - 1 && board.rooms[r][c] !== board.rooms[r][c+1]) cell.style.borderRight = '4px solid #1e293b';
+                    if (r < board.size - 1 && board.rooms[r][c] !== board.rooms[r+1][c]) cell.style.borderBottom = '4px solid #1e293b';
+
+                    if (!isGiven) {
+                        cell.oninput = (e) => {
+                            if (!gameActive) { e.target.value = ''; return; }
+                            e.target.classList.remove('error');
+                            let num = parseInt(e.target.value.trim());
+                            if (e.target.value.trim() === '' || e.target.value.trim() === '0') wsSend({type: 'move', row: r, col: c, value: 0});
+                            else if (!isNaN(num) && num > 0 && num <= board.size) wsSend({type: 'move', row: r, col: c, value: num});
+                            else e.target.value = ''; 
+                        };
+                    }
+                    container.appendChild(cell);
+                }
+            }
+        }
+        for (let r = 0; r < board.size; r++) {
+            for (let c = 0; c < board.size; c++) {
+                let cell = document.getElementById(`cell-${r}-${c}`);
+                if (!cell) continue;
+                let val = board.cells[r][c] > 0 ? board.cells[r][c] : '';
+                if (document.activeElement !== cell) {
+                    if (board.given[r][c]) cell.textContent = val;
+                    else cell.value = val;
+                }
+            }
+        }
+    }
+
+    function handleMessage(msg) {
+        switch (msg.type) {
+            case 'login_ok':
+                currentToken = msg.token; currentUser = msg.user; localStorage.setItem('token', msg.token);
+                document.getElementById('user-status').textContent = `👤 ${msg.user.username} 🟢`; showSection('lobby-section'); break;
+            case 'guest_ok':
+                currentUser = { id: -1, username: msg.username }; document.getElementById('user-status').textContent = `👤 ${msg.username} 🟢`; showSection('lobby-section'); break;
+            case 'login_fail': alert('Wrong username or password'); break;
+            case 'register_ok': alert('Account Created! You can now log in.'); break;
+            
+            case 'room_created':
+                isHost = true; currentRoom = msg.code; document.getElementById('waiting-code').textContent = msg.code;
+                document.getElementById('waiting-count').textContent = '1'; document.getElementById('start-party-btn').style.display = 'block';
+                document.getElementById('waiting-hint').style.display = 'none'; showSection('waiting-section'); break;
+            case 'room_joined':
+                isHost = false; currentRoom = msg.code; document.getElementById('waiting-code').textContent = msg.code;
+                document.getElementById('start-party-btn').style.display = 'none'; document.getElementById('waiting-hint').style.display = 'block';
+                showSection('waiting-section'); break;
+            case 'room_update': document.getElementById('waiting-count').textContent = msg.players; break;
+                
+            case 'game_start':
+                gameActive = true; currentBoard = msg.board; hintsLeft = 5; window.lastLeaderboard = [];
+                if (msg.code) currentRoom = msg.code;
+                else if (typeof msg.code !== 'undefined' && msg.code === '') currentRoom = null; 
+                
+                document.getElementById('controls').innerHTML = `
+                    <button class="secondary" onclick="getHint()" id="hint-btn">💡 Hint (5)</button>
+                    <button class="secondary" onclick="solveAuto()">🤖 Auto-Solve</button>
+                    <button onclick="checkBoard()">✅ Check Board</button>
+                `;
+                document.getElementById('room-info').innerHTML = currentRoom ? `Room: <span style="color:var(--primary)">${currentRoom}</span>` : 'Solo Play';
+                document.getElementById('leaderboard').innerHTML = '<li>Waiting for players...</li>';
+                showSection('game-section'); renderBoard(currentBoard); startTimer(0); break;
+            
+            case 'board_update':
+                if (currentBoard && msg.board) { currentBoard = msg.board; renderBoard(currentBoard); }
+                break;
+                
+            case 'move_ok': if (currentBoard) { currentBoard.cells[msg.row][msg.col] = msg.value; renderBoard(currentBoard); } break;
+            
+            case 'hint_ok':
+                if (currentBoard) {
+                    hintsLeft--; document.getElementById('hint-btn').textContent = `💡 Hint (${hintsLeft})`;
+                    currentBoard.cells[msg.row][msg.col] = msg.value; renderBoard(currentBoard);
+                    let cell = document.getElementById(`cell-${msg.row}-${msg.col}`);
+                    if (cell) {
+                        cell.style.transition = 'none'; cell.style.backgroundColor = '#fbbf24'; cell.style.transform = 'scale(1.15)'; cell.style.color = '#000';
+                        setTimeout(() => {
+                            cell.style.transition = 'all 0.6s ease'; cell.style.transform = 'scale(1)'; cell.style.color = 'var(--primary)';
+                            cell.style.backgroundColor = `hsl(${(currentBoard.rooms[msg.row][msg.col] * 137.508) % 360}, 60%, 90%)`;
+                        }, 600);
+                    }
+                }
+                break;
+            
+            case 'check_result':
+                if (msg.errors && msg.errors.length > 0) {
+                    renderBoard(currentBoard); 
+                    msg.errors.forEach(err => { let cell = document.getElementById(`cell-${err.r}-${err.c}`); if (cell) cell.classList.add('error'); });
+                } else { document.querySelectorAll('.cell.error').forEach(el => el.classList.remove('error')); }
+                break;
+                
+            case 'board_solved':
+                gameActive = false; clearInterval(timerInterval); document.getElementById('timer').textContent = `${msg.time}s`;
+                document.getElementById('room-info').innerHTML = `<span style="color: var(--success);">🎉 Finished! Waiting for others...</span>`;
+                
+                document.querySelectorAll('input.cell').forEach(inp => {
+                    inp.readOnly = true;
+                });
+                break;
+
+            case 'game_over':
+                gameActive = false; clearInterval(timerInterval);
+                document.getElementById('room-info').innerHTML = `<span style="color: var(--success);">🎉 Everyone Finished!</span>`;
+                
+                document.getElementById('controls').innerHTML = `
+                    <button class="accent" onclick="showSection('results-section')" style="font-size: 18px; padding: 15px;">🏆 View Final Standings</button>
+                `;
+                
+                let rankList = document.getElementById('final-ranking'); rankList.innerHTML = '';
+                let sorted = (window.lastLeaderboard || []).sort((a,b) => a.time - b.time);
+                sorted.forEach((p, index) => {
+                    let li = document.createElement('li');
+                    let medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `<span style="color:#94a3b8; width:25px; display:inline-block;">${index+1}.</span>`;
+                    li.innerHTML = `<span>${medal} ${p.name}</span>`;
+                    rankList.appendChild(li);
+                });
+                currentRoom = null;
+                break;
+
+            case 'leaderboard':
+                window.lastLeaderboard = msg.players;
+                let list = document.getElementById('leaderboard'); list.innerHTML = '';
+                let liveSorted = [...msg.players].sort((a,b) => {
+                    if (a.status !== b.status) return b.status - a.status;
+                    return a.time - b.time; 
+                });
+                let rank = 1;
+                liveSorted.forEach(p => {
+                    let item = document.createElement('li');
+                    if (p.status === 1) {
+                        let medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `#${rank}`;
+                        item.innerHTML = `<span>${medal} ${p.name}</span> <span class="time finished-time">${p.time}s</span>`;
+                        rank++;
+                    } else { item.innerHTML = `<span>⏳ ${p.name}</span> <span class="time">Solving...</span>`; }
+                    list.appendChild(item);
+                });
+                break;
+
+            case 'gallery_data':
+                let grid = document.getElementById('gallery-grid'); grid.innerHTML = '';
+                if (!msg.puzzles || msg.puzzles.length === 0) return grid.innerHTML = '<p>No puzzles found.</p>';
+                msg.puzzles.forEach(p => {
+                    let card = document.createElement('div'); card.className = 'gallery-card';
+                    card.innerHTML = `<div><strong style="display:block; font-size:18px;">${p.title}</strong><span style="color:var(--text-muted); font-size:14px;">${p.size}x${p.size} Grid</span></div><button onclick="wsSend({type:'start_game', puzzle_id:${p.id}})">▶ Play</button>`;
+                    grid.appendChild(card);
+                });
+                break;
+            
+            case 'validate_ok':
+                if(confirm("Awesome! Your puzzle has a valid solution.\n\nDo you want to publish it to the Public Gallery?")) {
+                    let cFlat = [], rFlat = [];
+                    for(let r=0; r<edBoard.size; r++) {
+                        for(let c=0; c<edBoard.size; c++) {
+                            cFlat.push(edBoard.cells[r][c]); rFlat.push(edBoard.rooms[r][c]);
+                        }
+                    }
+                    wsSend({ type: 'publish_puzzle', size: edBoard.size, title: edBoard.title, cells_flat: cFlat.join(','), rooms_flat: rFlat.join(',') });
+                }
+                break;
+            case 'validate_fail': alert("Uh oh! The Auto-Solver couldn't find a valid solution. Make sure every cell is covered by a room and the starting numbers don't break any rules."); break;
+            case 'publish_ok': alert("Successfully published! It is now live in the Gallery."); showGallery(); break;
+            case 'error_msg': alert(msg.message); break;
+        }
+    }
+  </script>
+</body>
+</html>
